@@ -101,3 +101,74 @@ def test_observabilitySolarElongationCut():
         True,
         True,
     ]
+
+
+def test_calibrationScaleNuisanceWeakensTheTest():
+    """Giving one instrument a free calibration scale makes L5 vs flat harder to separate, never easier."""
+    from ..forecast import distinguishN
+
+    ghz = np.array([40.0, 90.0, 150.0, 220.0, 345.0])
+    e0 = np.array([0.86, 0.845, 0.88, 0.903, 0.93])
+    th = 100.0 * (ghz / 150.0) ** 2
+    kernel = np.stack([np.full(5, 2 * np.log(10)), np.full(5, 0.8)], axis=-1)
+    sigma = 0.01 * th * e0
+    cov = np.diag([1e-8, 1e-8])
+    base = distinguishN(th, kernel, sigma, cov, e0, truth="L5")
+    mask = np.array(
+        [False, False, False, True, True]
+    )  # the two highest bands share a loose scale
+    loose = distinguishN(th, kernel, sigma, cov, e0, truth="L5", groups=[(mask, 0.1)])
+    pinned = distinguishN(th, kernel, sigma, cov, e0, truth="L5", groups=[(mask, 1e-6)])
+    assert 0 < loose["significance"] < base["significance"]
+    assert pinned["significance"] == pytest.approx(base["significance"], rel=1e-3)
+
+
+def test_distinguishNMatchesGridWrapper():
+    from ..forecast import distinguishN
+
+    th, kernel = _toy()
+    e0 = np.array([0.90, 0.86, 0.845, 0.88, 0.90, 0.92])
+    sigma = np.full(th.shape, 0.5)
+    cov = np.diag([1e-4, 1e-4])
+    a = distinguish(th, kernel, sigma, cov, e0, truth="L5")
+    T, B = th.shape
+    b = distinguishN(
+        th.ravel(),
+        kernel.reshape(T * B, 2),
+        sigma.ravel(),
+        cov,
+        np.tile(e0, T),
+        truth="L5",
+    )
+    assert a["significance"] == pytest.approx(b["significance"], rel=1e-6)
+
+
+def test_l5CovarianceNuisanceIsMarginalisedOverUnusedFrequencies():
+    """A near-singular covariance over extra, unused frequencies must give the same result as its marginal."""
+    from ..forecast import distinguishN
+
+    g = np.geomspace(20, 700, 15)
+    modes = np.stack([np.ones_like(g), np.log(g), np.log(g) ** 2], axis=1)
+    A = modes * np.array([0.01, 0.004, 0.001])
+    C15 = A @ A.T  # rank 3 over 15 frequencies
+    used = np.array([3, 5, 7, 9, 11, 13])
+    th = np.full(6, 50.0)
+    kernel = np.stack([np.full(6, 2 * np.log(10)), np.full(6, 0.8)], axis=-1)
+    e0 = 0.85 + 0.02 * np.log(g[used] / g[used][0])
+    sigma = 0.02 * th
+    cov = np.diag([1e-3, 1e-3])
+    full = distinguishN(
+        th, kernel, sigma, cov, e0, freqIdx=used, truth="flat", fTrue=0.7, covL5=C15
+    )
+    marg = distinguishN(
+        th,
+        kernel,
+        sigma,
+        cov,
+        e0,
+        freqIdx=np.arange(6),
+        truth="flat",
+        fTrue=0.7,
+        covL5=C15[np.ix_(used, used)],
+    )
+    assert full["significance"] == pytest.approx(marg["significance"], rel=2e-2)

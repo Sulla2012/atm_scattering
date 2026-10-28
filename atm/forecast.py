@@ -19,7 +19,9 @@ __all__ = [
     "SO_GHZ",
     "SO_LAT_DEG",
     "SO_LON_DEG",
+    "ALMA_GHZ",
     "distinguish",
+    "distinguishN",
     "eCovariance",
     "getEphemerides",
     "observability",
@@ -37,6 +39,20 @@ SO_ELEVATION_KM = 5.2
 SO_GHZ = np.array([30.0, 40.0, 90.0, 150.0, 220.0, 280.0])
 # 1-sigma point-source depth per day of observing [mJy] in each band
 SO_DEPTH_MJY = np.array([37.0, 25.0, 6.9, 8.3, 17.0, 49.0])
+
+# ALMA receiver bands: nominal centre frequencies [GHz] (Band 10, 787-950 GHz, lies outside the L5 e(nu) table;
+# Band 2 is in early science / commissioning)
+ALMA_GHZ = {
+    "B1": 43.0,
+    "B2": 78.0,
+    "B3": 100.0,
+    "B4": 144.0,
+    "B5": 187.0,
+    "B6": 233.0,
+    "B7": 343.0,
+    "B8": 442.0,
+    "B9": 661.0,
+}
 
 AU = Constants.ASTRONOMICAL_UNIT
 
@@ -251,33 +267,145 @@ def _invVar(sigma: np.ndarray) -> np.ndarray:
     )
 
 
-def _fitFlat(data, th, kernel, w, priorInv):
-    """Minimise chi^2 of the flat hypothesis (free f, nuisance dtheta); returns the optimiser result."""
+def _fit(
+    data: np.ndarray,
+    th: np.ndarray,
+    kernel: np.ndarray,
+    w: np.ndarray,
+    priorInv: np.ndarray,
+    e0: np.ndarray,
+    freqIdx: np.ndarray,
+    covL5: np.ndarray | None,
+    groups: list,
+    hypothesis: str,
+):
+    """
+    Minimise chi^2 of one hypothesis over its free and nuisance parameters.
+
+    Parameters are f (flat hypothesis only), dtheta (2), one log-scale nuisance per entry of `groups`, and the
+    amplitudes of the significant eigenmodes of the L5 e covariance (L5 hypothesis with a covariance only). All entries are 1-d
+    arrays over the N measurements, except kernel (N, 2).
+    """
+    N = len(th)
+    K = len(groups)
+    masks = np.array([g[0] for g in groups], dtype=float).reshape(K, N)
+    gInv = np.array([1.0 / g[1] ** 2 for g in groups])
+    # The L5 e(nu) posterior is a smooth curve, so its covariance is nearly singular; parametrise the nuisance by the
+    # significant eigenmodes (de = Ls @ a with a ~ N(0, 1)) instead of inverting the covariance.
+    Ls = None
+    if covL5 is not None and hypothesis == "L5":
+        lam, V = np.linalg.eigh(np.asarray(covL5, dtype=float))
+        keep = lam > 1e-10 * lam.max()
+        Ls = V[:, keep] * np.sqrt(lam[keep])
+    F = Ls.shape[1] if Ls is not None else 0
+    off = 1 if hypothesis == "flat" else 0
 
     def fn(p: np.ndarray) -> float:
-        m = p[0] * th * np.exp(kernel @ p[1:])
-        return float((w * (data - m) ** 2).sum() + p[1:] @ priorInv @ p[1:])
+        dth, ds = p[off : off + 2], p[off + 2 : off + 2 + K]
+        if hypothesis == "flat":
+            e = p[0]
+        else:
+            a = p[off + 2 + K :]
+            e = e0 + ((Ls @ a)[freqIdx] if F else 0.0)
+        m = e * th * np.exp(kernel @ dth + ds @ masks)
+        c = float(
+            (w * (data - m) ** 2).sum() + dth @ priorInv @ dth + (gInv * ds**2).sum()
+        )
+        return c + (float(a @ a) if F else 0.0)
 
-    starts = [np.r_[f0, 0.0, 0.0] for f0 in (0.6, 0.85, 1.1)]
+    n = off + 2 + K + F
+    starts = (
+        [np.r_[f0, np.zeros(n - 1)] for f0 in (0.6, 0.85, 1.1)]
+        if hypothesis == "flat"
+        else [np.zeros(n)]
+    )
     return min((minimize(fn, s0, method="BFGS") for s0 in starts), key=lambda o: o.fun)
 
 
-def _fitL5(data, th, kernel, w, priorInv, e0, covL5):
-    """Minimise chi^2 of the L5 hypothesis (fixed e_b up to the Gaussian uncertainty covL5, nuisance dtheta)."""
-    B = len(e0)
-    eInv = np.linalg.inv(covL5) if covL5 is not None else None
+def distinguishN(
+    th: np.ndarray,
+    kernel: np.ndarray,
+    sigma: np.ndarray,
+    priorCov: np.ndarray,
+    e0: np.ndarray,
+    freqIdx: np.ndarray | None = None,
+    truth: str = "L5",
+    fTrue: float | None = None,
+    covL5: np.ndarray | None = None,
+    groups: list | None = None,
+) -> dict:
+    """
+    Expected (Asimov) test between an L5-like emissivity and a flat mm emissivity for an arbitrary set of N
+    measurements, marginalising over the IR thermal model and over per-instrument calibration scales.
 
-    def fn(p: np.ndarray) -> float:
-        dth, de = p[:2], p[2:]
-        m = (e0 + de) * th * np.exp(kernel @ dth)
-        c = float((w * (data - m) ** 2).sum() + dth @ priorInv @ dth)
-        return c + (float(de @ eInv @ de) if eInv is not None else 0.0)
+    Every measurement i predicts flux_i = e_i * Th_i * exp(kernel_i . dtheta + sum_k mask_ki ds_k): the thermal flux
+    Th (eps_IR included) at the central IR-fit parameters, the IR-model nuisance dtheta (Gaussian prior `priorCov`)
+    and optional multiplicative calibration nuisances ds_k (one per entry of `groups`, each applying to the
+    measurements selected by its mask, with a Gaussian prior of the given fractional width). The L5 hypothesis has
+    the fixed e_i = e0_i (optionally with the Gaussian uncertainty `covL5`, one entry per distinct frequency, see
+    `freqIdx`); the flat hypothesis has e_i = f with f free.
 
-    free = B if covL5 is not None else 0
-    if free == 0:  # without an L5 uncertainty only dtheta is free
-        res = minimize(lambda q: fn(np.r_[q, np.zeros(B)]), np.zeros(2), method="BFGS")
-        return res
-    return minimize(fn, np.zeros(2 + B), method="BFGS")
+    The statistic is dchi2 = chi2_min(wrong hypothesis) given data equal to the true model (evaluated at its own
+    central values), and the significance is sqrt(dchi2).
+
+    Parameters
+    ----------
+    th : `~numpy.ndarray` (N)
+        eps_IR x thermal flux at eps = 1 at the central IR-fit parameters [mJy].
+    kernel : `~numpy.ndarray` (N, 2)
+        d ln Th / d(logD, logT1).
+    sigma : `~numpy.ndarray` (N)
+        1-sigma noise of each measurement [mJy], infinite to drop one.
+    priorCov : `~numpy.ndarray` (2, 2)
+        Covariance of (logD, logT1) from the IR fit.
+    e0 : `~numpy.ndarray` (N)
+        Central L5 e at each measurement's frequency.
+    freqIdx : `~numpy.ndarray` (N), optional
+        Index of each measurement's frequency into the rows of `covL5`.
+    truth : {"L5", "flat"}, optional
+        Which hypothesis generates the data (data = fTrue * th for "flat").
+        [Default = "L5"]
+    fTrue : float, optional
+        The flat emissivity of the truth when truth == "flat".
+    covL5 : `~numpy.ndarray` (F, F), optional
+        Covariance of the L5 e at the F distinct frequencies (nuisance of the L5 hypothesis).
+    groups : list of (mask, fractional sigma), optional
+        Calibration-scale nuisances: boolean mask over the N measurements and the 1-sigma fractional prior.
+
+    Returns
+    -------
+    dict
+        dchi2, significance, the best-fit IR-model shifts dtheta and, for truth == "L5", the best-fit flat f.
+    """
+    th, sigma, e0 = (np.asarray(x, dtype=float) for x in (th, sigma, e0))
+    w = _invVar(sigma)
+    priorInv = np.linalg.inv(priorCov)
+    freqIdx = (
+        np.zeros(len(th), dtype=int)
+        if freqIdx is None
+        else np.asarray(freqIdx, dtype=int)
+    )
+    groups = groups or []
+    if truth == "L5":
+        res = _fit(e0 * th, th, kernel, w, priorInv, e0, freqIdx, covL5, groups, "flat")
+        return {
+            "dchi2": float(res.fun),
+            "significance": float(np.sqrt(max(res.fun, 0.0))),
+            "f_best": float(res.x[0]),
+            "dtheta": res.x[1:3],
+        }
+    if truth == "flat":
+        if fTrue is None:
+            raise ValueError("fTrue is required when truth == 'flat'")
+        res = _fit(
+            fTrue * th, th, kernel, w, priorInv, e0, freqIdx, covL5, groups, "L5"
+        )
+        return {
+            "dchi2": float(res.fun),
+            "significance": float(np.sqrt(max(res.fun, 0.0))),
+            "dtheta": res.x[:2],
+        }
+    raise ValueError("truth must be 'L5' or 'flat'")
 
 
 def distinguish(
@@ -291,14 +419,8 @@ def distinguish(
     covL5: np.ndarray | None = None,
 ) -> dict:
     """
-    Expected (Asimov, noiseless-data) test between an L5-like emissivity and a flat mm emissivity, marginalising
-    over the uncertainty of the IR thermal model.
-
-    Both hypotheses predict flux(t, b) = e_b * Th(t, b) * exp(kernel . dtheta), where Th is the thermal flux (eps_IR
-    included) at the central IR-fit parameters and dtheta = (d logD, d logT1) are nuisance parameters with the
-    Gaussian prior `priorCov`. The L5 hypothesis has the fixed e_b = e0 (optionally with the Gaussian uncertainty
-    `covL5`); the flat hypothesis has e_b = f for every band with f free. The statistic is
-    dchi2 = chi2_min(wrong hypothesis) given data equal to the true model, and the significance is sqrt(dchi2).
+    `distinguishN` for a regular (T, B) grid of measurements: T days (or epochs) in the same B bands, with no
+    calibration nuisances.
 
     Parameters
     ----------
@@ -307,46 +429,31 @@ def distinguish(
     kernel : `~numpy.ndarray` (T, B, 2)
         d ln Th / d(logD, logT1).
     sigma : `~numpy.ndarray` (T, B)
-        1-sigma noise of each daily measurement [mJy], infinite for days that are not observed.
+        1-sigma noise of each measurement [mJy], infinite for days that are not observed.
     priorCov : `~numpy.ndarray` (2, 2)
         Covariance of (logD, logT1) from the IR fit.
     e0 : `~numpy.ndarray` (B)
         Central e_b of the L5 hypothesis.
-    truth : {"L5", "flat"}, optional
-        Which hypothesis generates the data. For "flat" the data are fTrue * th.
-        [Default = "L5"]
-    fTrue : float, optional
-        The flat emissivity of the truth when truth == "flat".
-    covL5 : `~numpy.ndarray` (B, B), optional
-        Covariance of the L5 e_b (nuisance of the L5 hypothesis).
+    truth, fTrue, covL5 :
+        As in `distinguishN`; covL5 is (B, B).
 
     Returns
     -------
     dict
-        dchi2, significance, and for truth == "L5" the best-fit flat f; the best-fit nuisance shifts.
+        As in `distinguishN`.
     """
-    w = _invVar(sigma)
-    priorInv = np.linalg.inv(priorCov)
-    if truth == "L5":
-        data = e0[None, :] * th
-        res = _fitFlat(data, th, kernel, w, priorInv)
-        return {
-            "dchi2": float(res.fun),
-            "significance": float(np.sqrt(max(res.fun, 0.0))),
-            "f_best": float(res.x[0]),
-            "dtheta": res.x[1:],
-        }
-    if truth == "flat":
-        if fTrue is None:
-            raise ValueError("fTrue is required when truth == 'flat'")
-        data = fTrue * th
-        res = _fitL5(data, th, kernel, w, priorInv, e0, covL5)
-        return {
-            "dchi2": float(res.fun),
-            "significance": float(np.sqrt(max(res.fun, 0.0))),
-            "dtheta": res.x[:2],
-        }
-    raise ValueError("truth must be 'L5' or 'flat'")
+    T, B = th.shape
+    return distinguishN(
+        th.ravel(),
+        kernel.reshape(T * B, 2),
+        sigma.ravel(),
+        priorCov,
+        np.tile(np.asarray(e0, dtype=float), T),
+        freqIdx=np.tile(np.arange(B), T),
+        truth=truth,
+        fTrue=fTrue,
+        covL5=covL5,
+    )
 
 
 def eCovariance(npz: str | Path, ghz: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
