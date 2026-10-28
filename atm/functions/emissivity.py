@@ -10,6 +10,7 @@ __all__ = [
     "EmissivityTable",
     "evalEmissivity",
     "ghzGridToLambda",
+    "ghzListToLambda",
     "ghzToLambda",
     "lambdaToGHz",
 ]
@@ -73,7 +74,25 @@ def ghzGridToLambda(
     `~numpy.ndarray`
         Wavelengths in m, in order of increasing frequency.
     """
-    lambd = ghzToLambda(np.arange(fmin, fmax + df / 2, df))
+    return ghzListToLambda(np.arange(fmin, fmax + df / 2, df))
+
+
+def ghzListToLambda(f_ghz: np.ndarray) -> np.ndarray:
+    """
+    Wavelengths of arbitrary frequencies, rounded to the precision of the table file names
+    (valid keys for `~atm.models.Model.loadLambdaTables`).
+
+    Parameters
+    ----------
+    f_ghz : float or `~numpy.ndarray`
+        Frequencies in GHz.
+
+    Returns
+    -------
+    `~numpy.ndarray`
+        Wavelengths in m.
+    """
+    lambd = np.atleast_1d(ghzToLambda(f_ghz))
     return np.array([float(f"{x / 1e-6:015.10f}e-06") for x in lambd])
 
 

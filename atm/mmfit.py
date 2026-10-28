@@ -2,12 +2,15 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import sqlite3
+
 import emcee
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
 
 from .config import Config
+from .data_processing import modifyErrors
 from .constants import Constants
 from .functions.emissivity import EmissivityTable, ghzToLambda
 from .functions.hg import calcQ
@@ -16,7 +19,13 @@ from .functions.interpolate_flux_lambda import (
     interpFluxLambdaObsWithSunlight,
 )
 
-__all__ = ["fitEmcee", "fluxLambdaToJy", "predictMm"]
+__all__ = [
+    "checkTableRange",
+    "fitEmcee",
+    "fluxLambdaToJy",
+    "loadWiseFromDb",
+    "predictMm",
+]
 
 AU = Constants.ASTRONOMICAL_UNIT
 c = Constants.LIGHTSPEED
@@ -41,6 +50,72 @@ def fluxLambdaToJy(flux: np.ndarray, lambd: np.ndarray) -> np.ndarray:
         Flux density in Jy.
     """
     return flux * np.asarray(lambd) ** 2 / c * 1e26
+
+
+def checkTableRange(model, lambd: float, T_ss, alpha) -> None:
+    """
+    Raise if T_ss or alpha fall outside the grid of the loaded lookup table at lambd (the spline
+    would otherwise silently clamp to the edge).
+
+    Parameters
+    ----------
+    model : `~atm.models.Model`
+        Flux model with tables loaded.
+    lambd : float
+        Wavelength in m (a loaded table key).
+    T_ss : float or `~numpy.ndarray`
+        Subsolar temperature in K.
+    alpha : float or `~numpy.ndarray`
+        Phase angle in radians.
+
+    Raises
+    ------
+    ValueError
+        If any value lies outside the table.
+    """
+    tx, ty = model.loadedLambdaTables[lambd].get_knots()
+    for name, v, lo, hi in [
+        ("T_ss", T_ss, tx[0], tx[-1]),
+        ("alpha", alpha, ty[0], ty[-1]),
+    ]:
+        if np.min(v) < lo or np.max(v) > hi:
+            raise ValueError(
+                f"{name} range [{np.min(v):.4g}, {np.max(v):.4g}] outside table [{lo:.4g}, {hi:.4g}]"
+            )
+
+
+def loadWiseFromDb(db, designation: str, sigma: float, obs) -> pd.DataFrame:
+    """
+    Load clipped WISE observations of one object from an atm_data sample database, following
+    the paper1 procedure (keep == 1, then `~atm.modifyErrors` adds sigma magnitudes of error).
+
+    Parameters
+    ----------
+    db : str or `~pathlib.Path`
+        sqlite database with an `observations` table (e.g. atm_data/paper1/sample.db).
+    designation : str
+        Object designation as stored in the database (e.g. "4" for Vesta).
+    sigma : float
+        Magnitude error offset added by `~atm.modifyErrors`.
+    obs : `~atm.obs.WISE`
+        Observatory used to convert the magnitude errors to flux errors.
+
+    Returns
+    -------
+    `~pandas.DataFrame`
+        Observations with an `alpha_rad` column.
+    """
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+        df = pd.read_sql(
+            "SELECT * FROM observations WHERE designation = ? AND keep = 1",
+            con,
+            params=(designation,),
+        )
+    if df.empty:
+        raise ValueError(f"No kept observations of {designation} in {db}")
+    df = modifyErrors(df, obs, sigma=sigma)
+    df["alpha_rad"] = np.radians(df["alpha_deg"])
+    return df
 
 
 def _epsPerFilter(obs, eps: float, epsFixed: dict | None) -> np.ndarray:
@@ -275,6 +350,7 @@ def predictMm(
             else EmissivityTable.fromNpz(emissivity, draw=int(rng.integers(nEps)))
         )
         for j, lj in enumerate(lam):
+            checkTableRange(model, lj, 10**logT1 / np.sqrt(r), alpha)
             F[i, j] = fluxLambdaToJy(
                 interpFluxLambdaAtObs(
                     model, r, delta, lj, 10**logT1 / np.sqrt(r), 10**logD, alpha, table

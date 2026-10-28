@@ -5,7 +5,7 @@ import argparse
 import numpy as np
 
 from atm.config import Config
-from atm.functions.emissivity import ghzGridToLambda
+from atm.functions.emissivity import ghzGridToLambda, ghzListToLambda
 from atm.models import NEATM
 
 
@@ -15,6 +15,13 @@ def main() -> None:
     ap.add_argument("--fmin", type=float, default=50.0, help="GHz")
     ap.add_argument("--fmax", type=float, default=1500.0, help="GHz")
     ap.add_argument("--df", type=float, default=25.0, help="GHz")
+    ap.add_argument(
+        "--freqs",
+        type=float,
+        nargs="+",
+        default=None,
+        help="GHz; extra frequencies built in addition to the grid",
+    )
     ap.add_argument("--tmin", type=float, default=100.0, help="K")
     ap.add_argument("--tmax", type=float, default=1200.0, help="K")
     ap.add_argument("--amin", type=float, default=0.0, help="rad")
@@ -44,8 +51,13 @@ def main() -> None:
     if a.debug:
         a.df, a.tstep, a.alpha_step = (a.fmax - a.fmin) / 2, 50.0, np.pi / 8
     model = NEATM() if a.out is None else NEATM(tableDir=a.out)
+    lambdas = ghzGridToLambda(a.fmin, a.fmax, a.df)
+    if a.freqs:
+        lambdas = np.unique(
+            np.concatenate([lambdas, ghzListToLambda(np.array(a.freqs))])
+        )
     model.buildLambdaTables(
-        ghzGridToLambda(a.fmin, a.fmax, a.df),
+        lambdas,
         tRange=[a.tmin, a.tmax],
         alphaRange=[a.amin, a.amax],
         tStep=a.tstep,

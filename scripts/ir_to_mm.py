@@ -1,7 +1,6 @@
 """Fit IR photometry (WISE or SPHEREx) with NEATM and predict the mm spectrum with Meteorites-TeraFlash e(f)."""
 
 import argparse
-import sqlite3
 from pathlib import Path
 
 import matplotlib
@@ -11,11 +10,10 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
-from atm import modifyErrors
 from atm.config import Config
 from atm.constants import Constants
 from atm.functions.emissivity import EmissivityTable, ghzToLambda
-from atm.mmfit import _modelFlux, fitEmcee, fluxLambdaToJy, predictMm
+from atm.mmfit import _modelFlux, fitEmcee, fluxLambdaToJy, loadWiseFromDb, predictMm
 from atm.models import NEATM
 from atm.obs import WISE, SPHEREx
 
@@ -70,40 +68,6 @@ def syntheticData(
     )
     for i, name in enumerate(obs.filterNames):
         df[f"flux_{name}_si"], df[f"fluxErr_{name}_si"] = Y[:, i], err[:, i]
-    return df
-
-
-def loadWiseFromDb(db: Path, designation: str, sigma: float, obs: WISE) -> pd.DataFrame:
-    """
-    Load clipped WISE observations of one object from an atm_data sample database, following
-    the paper1 procedure (keep == 1, then `~atm.modifyErrors` adds sigma magnitudes of error).
-
-    Parameters
-    ----------
-    db : `~pathlib.Path`
-        sqlite database with an `observations` table (e.g. atm_data/paper1/sample.db).
-    designation : str
-        Object designation as stored in the database (e.g. "4" for Vesta).
-    sigma : float
-        Magnitude error added in quadrature-free offset form by `~atm.modifyErrors`.
-    obs : `~atm.obs.WISE`
-        Observatory used to convert the magnitude errors to flux errors.
-
-    Returns
-    -------
-    `~pandas.DataFrame`
-        Observations with an `alpha_rad` column.
-    """
-    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
-        df = pd.read_sql(
-            "SELECT * FROM observations WHERE designation = ? AND keep = 1",
-            con,
-            params=(designation,),
-        )
-    if df.empty:
-        raise ValueError(f"No kept observations of {designation} in {db}")
-    df = modifyErrors(df, obs, sigma=sigma)
-    df["alpha_rad"] = np.radians(df["alpha_deg"])
     return df
 
 
