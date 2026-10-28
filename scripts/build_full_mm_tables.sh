@@ -2,7 +2,9 @@
 # Build the full NEATM lookup tables for the mm/THz range: 50-1500 GHz every 25 GHz plus the ACT band centres
 # (90 and 220 GHz), T_ss = 100-1200 K every 10 K, phase angle 0-180 deg every 5 deg.
 # Restartable: tables that already exist are skipped. Usage: scripts/build_full_mm_tables.sh [outdir]
-# Progress: grep -c "^Done" <outdir>/build.log ; finished when <outdir>/DONE exists.
+# Progress: grep -c "^Done" <outdir>/build.log (the build is complete when this reaches the number of tables, 61).
+# <outdir>/DONE is written by this wrapper when the build ends, but in one run it was missing although the
+# build had finished (the wrapper was apparently killed at logout), so check the log rather than relying on it.
 cd "$(dirname "$0")/.." || exit 1
 OUT=${1:-data/mm_tables}
 PY=${PYTHON:-/usr/bin/python3.12}
