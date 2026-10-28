@@ -23,6 +23,7 @@ __all__ = [
     "checkTableRange",
     "fitEmcee",
     "fluxLambdaToJy",
+    "lightcurveModulation",
     "PRESCRIPTIONS",
     "fitPrescriptions",
     "loadWiseFromDb",
@@ -181,6 +182,7 @@ def fitPrescriptions(
     prescriptions: dict | None = None,
     nsteps: int = 1500,
     burnIn: int = 500,
+    lightcurve: dict | None = None,
 ) -> list[dict]:
     """
     Fit the same WISE data under several emissivity prescriptions to measure the systematic spread of the
@@ -201,6 +203,8 @@ def fitPrescriptions(
         [Default = `PRESCRIPTIONS`]
     nsteps, burnIn : int, optional
         Chain length per fit.
+    lightcurve : dict, optional
+        Passed to `fitEmcee`.
 
     Returns
     -------
@@ -217,6 +221,7 @@ def fitPrescriptions(
             columnMapping=columnMapping,
             nsteps=nsteps,
             burnIn=burnIn,
+            lightcurve=lightcurve,
             verbose=False,
             **kw,
         )
@@ -320,6 +325,44 @@ def _modelFlux(
     return flux.T if wiseLike else flux
 
 
+def lightcurveModulation(
+    mjd: np.ndarray, coeffs: np.ndarray, period_h: float, t0: float | None = None
+) -> np.ndarray:
+    """
+    Multiplicative rotational lightcurve, a two-term Fourier series (a double-peaked lightcurve plus a first
+    harmonic, as in Eq. 5 of Orlowski-Scherer et al. 2024).
+
+    m(p) = 1 + a2 cos(4 pi p) + b2 sin(4 pi p) + a1 cos(2 pi p) + b1 sin(2 pi p),  p = ((t - t0) / P) mod 1.
+
+    Parameters
+    ----------
+    mjd : `~numpy.ndarray` (N)
+        Observation times in MJD.
+    coeffs : `~numpy.ndarray` (4)
+        a2, b2, a1, b1.
+    period_h : float
+        Rotation period in hours.
+    t0 : float, optional
+        Reference epoch (MJD) of rotational phase 0; arbitrary because the phases are fitted.
+        [Default = the earliest time in mjd]
+
+    Returns
+    -------
+    `~numpy.ndarray` (N)
+        Flux multiplier.
+    """
+    t0 = np.min(mjd) if t0 is None else t0
+    ph = ((np.asarray(mjd) - t0) / (period_h / 24.0)) % 1.0
+    a2, b2, a1, b1 = coeffs
+    return (
+        1.0
+        + a2 * np.cos(4 * np.pi * ph)
+        + b2 * np.sin(4 * np.pi * ph)
+        + a1 * np.cos(2 * np.pi * ph)
+        + b1 * np.sin(2 * np.pi * ph)
+    )
+
+
 def fitEmcee(
     model,
     obs,
@@ -328,6 +371,7 @@ def fitEmcee(
     parameterPriors: dict = Config.parameterPriors,
     epsFixed: dict | None = None,
     neowise: dict | None = None,
+    lightcurve: dict | None = None,
     nwalkers: int = 32,
     nsteps: int = 3000,
     burnIn: int = 1000,
@@ -361,6 +405,10 @@ def fitEmcee(
         NEOWISE prescription, {"eps": 0.9, "bands": ["W1", "W2"]}: all filters share the fixed emissivity, the
         albedo p of the listed bands is fitted instead of eps, and the other filters have p = 0. The third
         parameter (column) is then p. Overrides epsFixed.
+    lightcurve : dict, optional
+        {"period_h": P}: fit a rotational lightcurve, a flux multiplier common to all bands (see
+        `lightcurveModulation`; four extra parameters lc_a2, lc_b2, lc_a1, lc_b1, uniform in [-0.5, 0.5]). It removes
+        the need for a large error floor to absorb the rotational variability.
     nwalkers : int, optional
         Number of emcee walkers.
     nsteps : int, optional
@@ -390,6 +438,17 @@ def fitEmcee(
     names = FIT_PARAMETERS[:2] + (["eps"] if neowise is None else ["p"])
     lo = np.array([parameterPriors[n]["lower"] for n in names])
     hi = np.array([parameterPriors[n]["upper"] for n in names])
+    mjd = data[columnMapping["exp_mjd"]].values.astype(float) if lightcurve else None
+    if lightcurve:
+        names += ["lc_a2", "lc_b2", "lc_a1", "lc_b1"]
+        lo, hi = np.r_[lo, -0.5 * np.ones(4)], np.r_[hi, 0.5 * np.ones(4)]
+    ndim = len(names)
+
+    def modulation(theta: np.ndarray) -> np.ndarray:
+        """Rotational flux multiplier per observation (ones without a lightcurve)."""
+        if not lightcurve:
+            return np.ones(len(r))
+        return lightcurveModulation(mjd, theta[3:7], lightcurve["period_h"])
 
     def chi2(theta: np.ndarray) -> float:
         T_ss = 10 ** theta[1] / np.sqrt(r)
@@ -400,20 +459,14 @@ def fitEmcee(
             or np.any(alpha > np.pi)
         ):
             return np.inf
-        return float(
-            (
-                (
-                    (
-                        Y
-                        - _modelFlux(
-                            model, obs, theta, r, delta, alpha, G, epsFixed, neowise
-                        )
-                    )
-                    / Y_err
-                )[good]
-                ** 2
-            ).sum()
+        m = modulation(theta)
+        if np.any(m <= 0):
+            return np.inf
+        flux = (
+            _modelFlux(model, obs, theta[:3], r, delta, alpha, G, epsFixed, neowise)
+            * m[:, None]
         )
+        return float((((Y - flux) / Y_err)[good] ** 2).sum())
 
     def logProb(theta: np.ndarray) -> float:
         if np.any(theta < lo) or np.any(theta > hi):
@@ -432,6 +485,7 @@ def fitEmcee(
             rng.uniform(logT1_lo, logT1_hi, 400),
             rng.uniform(0.5, 1, 400) if neowise is None else rng.uniform(0, 1, 400),
         ]
+        + [np.zeros(400)] * (ndim - 3)
     )
     start = box[np.argmin([chi2(t) for t in box])]
     start = minimize(
@@ -439,9 +493,9 @@ def fitEmcee(
         start,
         method="Nelder-Mead",
     ).x
-    p0 = start + 1e-3 * rng.standard_normal((nwalkers, 3))
+    p0 = start + 1e-3 * rng.standard_normal((nwalkers, ndim))
     p0[:, 2] = np.minimum(p0[:, 2], hi[2] - 1e-6)
-    sampler = emcee.EnsembleSampler(nwalkers, 3, logProb)
+    sampler = emcee.EnsembleSampler(nwalkers, ndim, logProb)
     sampler.random_state = np.random.RandomState(
         seed
     ).get_state()  # reproducible chains

@@ -148,3 +148,53 @@ def test_fitPrescriptionsAndFlux(synthetic):
     assert [q["eps_tail"] for q in out] == [0.9, 0.98]
     f = prescriptionFluxJy(model, 1e-3, out[0], (2.0, 1.2, 0.3))
     assert np.isfinite(f) and f > 0
+
+
+def test_lightcurveModulation():
+    from ..mmfit import lightcurveModulation
+
+    t = np.linspace(0, 1, 7)
+    np.testing.assert_allclose(lightcurveModulation(t, np.zeros(4), 12.0), 1.0)
+    P = 12.0
+    m = lightcurveModulation(t, np.array([0.2, 0, 0, 0]), P, t0=0.0)
+    np.testing.assert_allclose(m, 1 + 0.2 * np.cos(4 * np.pi * ((t / (P / 24)) % 1)))
+
+
+def test_lightcurveFitRecoversTruthWithSmallErrors(synthetic):
+    """A fake object with a 20% rotational modulation: the lightcurve fit finds it; a no-lightcurve fit cannot."""
+    from ..mmfit import lightcurveModulation
+
+    model, obs, df, cm = synthetic
+    rng = np.random.default_rng(5)
+    n = 16
+    d = pd.DataFrame(
+        {
+            "r_au": np.full(n, 2.0),
+            "delta_au": np.full(n, 1.2),
+            "alpha_rad": np.full(n, 0.4),
+            "G": 0.15,
+            "mjd": 55000.0 + np.sort(rng.uniform(0, 1.6, n)),
+        }
+    )
+    P, coeffs = 12.865, np.array([0.12, -0.08, 0.04, 0.03])
+    m = lightcurveModulation(d["mjd"].values, coeffs, P)
+    Y = (
+        _modelFlux(
+            model,
+            obs,
+            TRUTH,
+            d["r_au"].values,
+            d["delta_au"].values,
+            d["alpha_rad"].values,
+            0.15,
+        )
+        * m[:, None]
+    )
+    for i, name in enumerate(obs.filterNames):
+        d[f"flux_{name}_si"], d[f"fluxErr_{name}_si"] = Y[:, i], 0.02 * Y[:, i]
+    kw = dict(columnMapping=cm, nwalkers=24, nsteps=1200, burnIn=500, verbose=False)
+    withLc = fitEmcee(model, obs, d, lightcurve={"period_h": P}, **kw)
+    without = fitEmcee(model, obs, d, **kw)
+    assert withLc.attrs["chi2_best"] < 3 * withLc.attrs["ndata"]
+    assert without.attrs["chi2_best"] > 5 * withLc.attrs["chi2_best"]
+    assert abs(withLc["logD"].median() - TRUTH[0]) < 0.05
