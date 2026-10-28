@@ -15,6 +15,8 @@ def main() -> None:
     ap.add_argument("--fmin", type=float, default=50.0, help="GHz")
     ap.add_argument("--fmax", type=float, default=1500.0, help="GHz")
     ap.add_argument("--df", type=float, default=25.0, help="GHz")
+    ap.add_argument("--tmin", type=float, default=100.0, help="K")
+    ap.add_argument("--tmax", type=float, default=1200.0, help="K")
     ap.add_argument(
         "--tstep",
         type=float,
@@ -42,6 +44,7 @@ def main() -> None:
     model = NEATM() if a.out is None else NEATM(tableDir=a.out)
     model.buildLambdaTables(
         ghzGridToLambda(a.fmin, a.fmax, a.df),
+        tRange=[a.tmin, a.tmax],
         tStep=a.tstep,
         alphaStep=a.alpha_step,
         threads=a.threads,

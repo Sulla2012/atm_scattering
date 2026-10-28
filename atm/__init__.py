@@ -8,5 +8,8 @@ from .models import *
 from .obs import *
 from .analysis import *
 from .data_processing import *
-from .fit import *
+try:  # legacy pymc3/theano fitter; atm.mmfit is the emcee replacement
+    from .fit import *
+except ImportError:
+    pass
 from .plotting import *
