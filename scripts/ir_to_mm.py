@@ -147,6 +147,14 @@ def main() -> None:
         help="magnitude error added to db photometry",
     )
     ap.add_argument(
+        "--model",
+        choices=["kirchhoff", "neowise"],
+        default="kirchhoff",
+        help="kirchhoff: p = (1 - eps) / Q with a fitted eps (see --eps-fixed); neowise: eps fixed at "
+        "--neowise-eps in all bands, albedo fitted in W1/W2 only (paper1 run5a)",
+    )
+    ap.add_argument("--neowise-eps", type=float, default=0.9)
+    ap.add_argument(
         "--eps-fixed",
         nargs="+",
         default=[],
@@ -221,12 +229,16 @@ def main() -> None:
         )
     )
     epsFixed = {k: float(v) for k, v in (x.split("=") for x in a.eps_fixed)}
+    neowise = (
+        {"eps": a.neowise_eps, "bands": ["W1", "W2"]} if a.model == "neowise" else None
+    )
     samples = fitEmcee(
         model,
         obs,
         data,
         columnMapping=cm,
         epsFixed=epsFixed,
+        neowise=neowise,
         nsteps=a.nsteps,
         burnIn=a.nsteps // 3,
         verbose=False,
@@ -279,7 +291,9 @@ def main() -> None:
 
     fig, ax = plt.subplots(1, 3, figsize=(14, 3.8))
     lam = obs.filterEffectiveLambdas
-    logD, logT1, eps = samples[["logD", "logT1", "eps"]].median()
+    logD, logT1, third = samples[
+        list(samples.columns[:3])
+    ].median()  # third: eps, or p for neowise
     ax[0].errorbar(
         lam * 1e6,
         fluxLambdaToJy(data[cm["flux_si"]].values[0], lam),
@@ -289,10 +303,11 @@ def main() -> None:
     best = _modelFlux(
         model,
         obs,
-        np.array([logD, logT1, eps]),
+        np.array([logD, logT1, third]),
         *(data[cm[k]].values.astype(float) for k in ["r_au", "delta_au", "alpha_rad"]),
         float(data[cm["G"]].iloc[0]),
         epsFixed,
+        neowise,
     )
     ax[0].plot(lam * 1e6, fluxLambdaToJy(best[0], lam), "-")
     ax[0].set(
