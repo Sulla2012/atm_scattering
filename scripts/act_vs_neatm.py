@@ -21,7 +21,12 @@ from atm.config import Config
 from atm.constants import Constants
 from atm.functions.hg import calcHG, calcQ
 from atm.functions.flux_lambda import calcFluxLambdaSun
-from atm.functions.emissivity import ghzGridToLambda, ghzListToLambda, lambdaToGHz
+from atm.functions.emissivity import (
+    EmissivityTable,
+    ghzGridToLambda,
+    ghzListToLambda,
+    lambdaToGHz,
+)
 from atm.functions.interpolate_flux_lambda import interpFluxLambdaAtObs
 from atm.mmfit import checkTableRange, fitEmcee, fluxLambdaToJy, loadWiseFromDb
 from atm.models import NEATM
@@ -228,10 +233,22 @@ def sedFigure(
     )
     effL = obs.filterEffectiveLambdas
 
-    def flux(k: int, tail: float | None) -> np.ndarray:
-        """lambda^4 F_lambda [W m] for draw k; eps beyond W4 is `tail` (None: the W4 value)."""
+    def flux(k: int, tail: float | EmissivityTable | None) -> np.ndarray:
+        """
+        lambda^4 F_lambda [W m] for draw k. Beyond W4 the emissivity is `tail`: None keeps the W4 value, a float
+        is a flat eps, and an `~atm.functions.EmissivityTable` is used where it is defined (the W4 value
+        in the gap below its range, NaN above its longest wavelength, i.e. no extrapolation, and NaN inside the WISE
+        range so that only the part beyond W4 is drawn).
+        """
         eps = np.interp(lam, effL, eps4[k])
-        if tail is not None:
+        nanMask = np.zeros(lam.shape, bool)
+        if isinstance(tail, EmissivityTable):
+            f = lambdaToGHz(lam)
+            inr = (lam > effL[-1]) & (f >= tail.f_ghz[0]) & (f <= tail.f_ghz[-1])
+            eps = np.where(lam > effL[-1], eps4[k, -1], eps)
+            eps[inr] = tail(lam[inr])
+            nanMask = (lam <= effL[-1]) | (f < tail.f_ghz[0])
+        elif tail is not None:
             eps = np.where(lam > effL[-1], tail, eps)
         p = (1 - eps) / calcQ(G)
         D = 10 ** post["logD"].values[k]
@@ -240,8 +257,17 @@ def sedFigure(
             / (4 * d0**2 * AU**2)
             * (eps * th[k] + p * calcHG(al0, G) * calcFluxLambdaSun(lam, r0))
         )
-        return F * lam**4
+        return np.where(nanMask, np.nan, F * lam**4)
 
+    rng = np.random.default_rng(2)
+    tables = []
+    if a.emissivity:
+        nEps = len(np.load(a.emissivity)["e_draws"])
+        tables = [
+            EmissivityTable.fromNpz(a.emissivity, draw=int(i))
+            for i in rng.integers(nEps, size=len(T))
+        ]
+    l5 = np.array([flux(k, tables[k]) for k in range(len(T))]) if tables else None
     fig, ax = plt.subplots(figsize=(8, 5.5))
     base = np.array([flux(k, None) for k in range(len(T))])
     lo, med, hi = np.percentile(base, [2.5, 50, 97.5], axis=0)
@@ -259,6 +285,16 @@ def sedFigure(
             ls="--",
             c=f"C{i}",
             label=f"flat eps = {x:g} beyond W4",
+        )
+    if l5 is not None:
+        l5lo, l5med, l5hi = np.nanpercentile(l5, [2.5, 50, 97.5], axis=0)
+        ax.fill_between(lam * 1e6, l5lo, l5hi, alpha=0.25, color="C4")
+        ax.plot(
+            lam * 1e6,
+            l5med,
+            c="C4",
+            lw=2,
+            label=f"L5 e(f) beyond W4 ({Path(a.emissivity).stem}), 95%",
         )
     for j, n in enumerate(obs.filterNames):
         w, e = wise[cm["flux_si"][j]], wise[cm["fluxErr_si"][j]]
@@ -319,6 +355,9 @@ def sedFigure(
             ls="--",
             c=f"C{i}",
         )
+    if l5 is not None:
+        ins.fill_between(lam * 1e6, l5lo, l5hi, alpha=0.25, color="C4")
+        ins.plot(lam * 1e6, l5med, c="C4", lw=2)
     for x, y, ye, m in zoom:
         ins.errorbar(x, y, ye, fmt=m, c="r", ms=4)
     ins.set(xlim=(1.1e3, 3.4e3))
@@ -351,6 +390,12 @@ def main() -> None:
     )
     ap.add_argument("--flat-eps", type=float, nargs="+", default=[1.0, 0.9, 0.8])
     ap.add_argument("--n-draws", type=int, default=100)
+    ap.add_argument(
+        "--emissivity",
+        type=lambda x: Path(x) if x else None,
+        default=Path("../Meteorites-TeraFlash/results/emissivity/L5_l5c.npz"),
+        help="TeraFlash e(f) NPZ overlaid on the SED (pass an empty string to skip)",
+    )
     ap.add_argument(
         "--n-sed-draws",
         type=int,
