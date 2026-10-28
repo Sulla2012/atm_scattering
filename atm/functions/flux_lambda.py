@@ -11,6 +11,7 @@ from .hg import calcHG
 from .hg import calcQ
 from .temperature import calcTss
 from .blackbody import calcPlanckLambda
+from .emissivity import evalEmissivity
 
 
 __all__ = ["calcFluxLambdaSun",
@@ -81,7 +82,7 @@ def calcFluxLambdaAtObs(model, r, delta, lambd, T_ss, D, alpha, eps, threads=Con
         Returns array of fluxes at an observer or observatory.
     """
     return (D**2 / (4 * delta**2 * AU**2) *
-            (eps * model.calcTotalFluxLambdaEmittedToObsMany(lambd, T_ss, alpha)))
+            (evalEmissivity(eps, lambd) * model.calcTotalFluxLambdaEmittedToObsMany(lambd, T_ss, alpha)))
 
 
 def calcFluxLambdaAtObsWithSunlight(model, r, delta, lambd, T_ss, D, alpha, eps, p, G, threads=Config.threads):

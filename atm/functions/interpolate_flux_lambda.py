@@ -7,6 +7,7 @@ import pandas as pd
 from ..config import Config
 from ..constants import Constants
 from ..helpers import __handleParameters
+from .emissivity import evalEmissivity
 from .flux_lambda import calcFluxLambdaSun
 from .hg import calcHG
 from .hg import calcQ
@@ -51,7 +52,7 @@ def interpFluxLambdaAtObs(model, r, delta, lambd, T_ss, D, alpha, eps):
     float or `~numpy.ndarray` (N)
         Returns array of fluxes at an observer or observatory.
     """
-    return D**2 / (4 * delta**2 * AU**2) * (eps * model.interpTotalFluxLambdaEmittedToObs(lambd, T_ss, alpha))
+    return D**2 / (4 * delta**2 * AU**2) * (evalEmissivity(eps, lambd) * model.interpTotalFluxLambdaEmittedToObs(lambd, T_ss, alpha))
 
 
 def interpFluxLambdaAtObsWithSunlight(model, r, delta, lambd, T_ss, D, alpha, eps, p, G):

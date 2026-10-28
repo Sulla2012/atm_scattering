@@ -102,3 +102,4 @@ ENV/
 
 # SDSS MOC
 ADR4.dat
+atm/version.py
