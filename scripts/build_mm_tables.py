@@ -1,6 +1,7 @@
 """Build NEATM lookup tables on a regular GHz grid (50-1500 GHz) for use with frequency-dependent emissivity."""
 
 import argparse
+import os
 
 import numpy as np
 
@@ -50,7 +51,7 @@ def main() -> None:
     a = ap.parse_args()
     if a.debug:
         a.df, a.tstep, a.alpha_step = (a.fmax - a.fmin) / 2, 50.0, np.pi / 8
-    model = NEATM() if a.out is None else NEATM(tableDir=a.out)
+    model = NEATM() if a.out is None else NEATM(tableDir=os.path.join(a.out, ""))
     lambdas = ghzGridToLambda(a.fmin, a.fmax, a.df)
     if a.freqs:
         lambdas = np.unique(

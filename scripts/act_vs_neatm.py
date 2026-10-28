@@ -3,6 +3,7 @@ effective emissivity. NEATM is fit to WISE photometry (atm_data sample.db); the 
 true r, delta, alpha of every ACT observation (JPL Horizons)."""
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -482,13 +483,18 @@ def main() -> None:
     print(samples.describe().loc[["mean", "std"]].round(4), samples.attrs)
 
     # --- NEATM at every ACT observation
-    tabModel = NEATM(tableDir=a.table_dir)
+    tabModel = NEATM(
+        tableDir=os.path.join(a.table_dir, "")
+    )  # trailing slash: the model globs dir + pattern
     lams = {f: float(ghzListToLambda(np.array([g]))[0]) for f, g in BAND_GHZ.items()}
     gridLam = ghzGridToLambda(50, 400, 25)
     tabModel.loadLambdaTables(
         np.unique(np.concatenate([gridLam, list(lams.values())])), verbose=False
     )
     rows, res, stack = [], {}, []
+    if a.emissivity:
+        l5 = np.load(a.emissivity)
+        l5f, l5e = l5["f_ghz"], l5["e"]
     for (arr, f), df in act.items():
         e = eph.loc[jd[(arr, f)]]
         r, delta, alpha = (
@@ -508,6 +514,13 @@ def main() -> None:
             x: float((((df["flux"].values - x * Mmed) / df["err"].values) ** 2).sum())
             for x in a.flat_eps + [eps_best]
         }
+        eL5 = float(np.interp(BAND_GHZ[f], l5f, l5e)) if a.emissivity else np.nan
+        L5 = eL5 * Mmed  # NEOWISE-fit NEATM with the L5 e(f) at the band centre
+        ratioL5, ratioL5Err = (
+            weightedMean(df["flux"].values / L5, df["err"].values / L5)
+            if a.emissivity
+            else (np.nan, np.nan)
+        )
         ref = get_ast_weighted_flux(a.asteroid, arr, f)[
             0
         ]  # ASTRONAUT's weighted flux, scaled to 1 AU / 1 AU / alpha = 0
@@ -529,6 +542,12 @@ def main() -> None:
                 "NEATM_draw_spread": float(eps_k.std()),
                 **{f"chi2_eps{x:g}": chi2[x] for x in a.flat_eps},
                 "chi2_best": chi2[eps_best],
+                "e_L5": eL5,
+                "chi2_L5": float(
+                    (((df["flux"].values - L5) / df["err"].values) ** 2).sum()
+                ),
+                "ratio_to_L5": ratioL5,
+                "ratio_to_L5_err": ratioL5Err,
                 "ASTRONAUT_unit_geometry_mJy": float(ref),
                 "check_mine_mJy": mine,
             }
@@ -562,6 +581,10 @@ def main() -> None:
         for x in a.flat_eps:
             ax.plot(xs, x * xs, label=f"flat eps={x:g}")
         ax.plot(xs, d["eps_best"] * xs, "k--", label=f"best {d['eps_best']:.2f}")
+        if a.emissivity:
+            ax.plot(
+                xs, np.interp(BAND_GHZ[f], l5f, l5e) * xs, "m-", lw=2, label="L5 e(f)"
+            )
         ax.set(
             xlabel="NEATM (eps=1) [mJy]",
             ylabel="ACT [mJy]",

@@ -1,6 +1,7 @@
 """Fit IR photometry (WISE or SPHEREx) with NEATM and predict the mm spectrum with Meteorites-TeraFlash e(f)."""
 
 import argparse
+import os
 from pathlib import Path
 
 import matplotlib
@@ -249,7 +250,9 @@ def main() -> None:
     f_all = np.arange(a.fmin, a.fmax + a.df / 2, a.df)
     fe = np.load(a.emissivity)["f_ghz"]
     f = f_all[(f_all >= fe[0]) & (f_all <= fe[-1])]
-    mmModel = NEATM(tableDir=a.mm_table_dir) if a.mm_table_dir else model
+    mmModel = NEATM(
+        tableDir=os.path.join(a.mm_table_dir, "")
+    )  # trailing slash: the model globs dir + pattern if a.mm_table_dir else model
     r, delta, alpha = (
         float(data[cm[k]].iloc[0]) for k in ["r_au", "delta_au", "alpha_rad"]
     )
@@ -377,6 +380,7 @@ def main() -> None:
     bot.set(xlabel="GHz", ylabel="ratio to eps = 1")
     for ax_ in (top, mid, bot):
         ax_.relim()
+        ax_.margins(y=0.12)
         ax_.autoscale_view()
     bot.set_xlim(f[0] * 0.85, f[-1] * 1.2)
     if act:
