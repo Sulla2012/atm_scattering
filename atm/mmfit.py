@@ -442,6 +442,9 @@ def fitEmcee(
     p0 = start + 1e-3 * rng.standard_normal((nwalkers, 3))
     p0[:, 2] = np.minimum(p0[:, 2], hi[2] - 1e-6)
     sampler = emcee.EnsembleSampler(nwalkers, 3, logProb)
+    sampler.random_state = np.random.RandomState(
+        seed
+    ).get_state()  # reproducible chains
     sampler.run_mcmc(p0, nsteps, progress=verbose)
     flat = sampler.get_chain(discard=burnIn, flat=True)
     out = pd.DataFrame(flat, columns=names)
@@ -464,6 +467,7 @@ def predictMm(
     alpha: float,
     nDraws: int = 200,
     seed: int = 0,
+    scale: float = 1.0,
 ) -> dict:
     """
     Predict the thermal mm spectrum from IR-fit posterior samples and a frequency-dependent emissivity.
@@ -491,6 +495,10 @@ def predictMm(
         Number of posterior draws.
     seed : int, optional
         Random seed.
+    scale : float, optional
+        Factor applied to every emissivity curve, e.g. the IR emissivity when the table is a relative
+        distortion (eps(nu) = scale * e(nu)).
+        [Default = 1]
 
     Returns
     -------
@@ -514,6 +522,8 @@ def predictMm(
             if nEps == 0
             else EmissivityTable.fromNpz(emissivity, draw=int(rng.integers(nEps)))
         )
+        if scale != 1.0:
+            table = EmissivityTable(table.f_ghz, table.eps * scale)
         for j, lj in enumerate(lam):
             checkTableRange(model, lj, 10**logT1 / np.sqrt(r), alpha)
             F[i, j] = fluxLambdaToJy(

@@ -224,6 +224,13 @@ def main() -> None:
         "with the NEATM model, so its ratio to NEATM(eps = 1) is the exact implied emissivity)",
     )
     ap.add_argument(
+        "--l5-mode",
+        choices=["multiplicative", "absolute"],
+        default="multiplicative",
+        help="multiplicative: eps_mm(nu) = eps_IR x e(nu), i.e. e(nu) distorts the IR emissivity (eps_IR = the fixed "
+        "NEOWISE eps, the fixed W4 eps, or the fitted eps); absolute: eps_mm(nu) = e(nu)",
+    )
+    ap.add_argument(
         "--no-systematics",
         action="store_true",
         help="skip the emissivity-prescription fits (WISE only), which add the systematic spread to the SED",
@@ -270,6 +277,15 @@ def main() -> None:
         verbose=False,
     )
     print(samples.describe().loc[["mean", "std"]], samples.attrs)
+    # IR emissivity continued beyond W4, which e(nu) distorts in the multiplicative mode
+    epsTail = (
+        a.neowise_eps
+        if neowise
+        else epsFixed["W4"]
+        if "W4" in epsFixed
+        else float(samples["eps"].median())
+    )
+    tailScale = epsTail if a.l5_mode == "multiplicative" else 1.0
     # same data fitted under other emissivity prescriptions: systematic spread of the prediction
     presc = (
         fitPrescriptions(model, obs, data, cm)
@@ -277,7 +293,14 @@ def main() -> None:
         else None
     )
     fits = (
-        [{"name": "this fit", **samples[["logD", "logT1"]].median().to_dict()}] + presc
+        [
+            {
+                "name": "this fit",
+                "eps_tail": epsTail,
+                **samples[["logD", "logT1"]].median().to_dict(),
+            }
+        ]
+        + presc
         if presc
         else []
     )
@@ -293,7 +316,15 @@ def main() -> None:
         float(data[cm[k]].iloc[0]) for k in ["r_au", "delta_au", "alpha_rad"]
     )
     pred = predictMm(
-        mmModel, samples, a.emissivity, f, r, delta, alpha, nDraws=a.n_draws
+        mmModel,
+        samples,
+        a.emissivity,
+        f,
+        r,
+        delta,
+        alpha,
+        nDraws=a.n_draws,
+        scale=tailScale,
     )
     const = predictMm(
         mmModel,
@@ -339,10 +370,16 @@ def main() -> None:
                 for q in fits
             ]
         )
-        envE = ((eMed * thP).min(0), (eMed * thP).max(0))  # e(f) prediction (Jy)
+        tails = (
+            np.array([q["eps_tail"] for q in fits])[:, None]
+            if a.l5_mode == "multiplicative"
+            else 1.0
+        )
+        modelE = eMed * tails * thP  # e(f) prediction (Jy) of each prescription
+        envE = (modelE.min(0), modelE.max(0))
         for g in (100.0, 150.0, 225.0):
             j = int(np.argmin(np.abs(f - g)))
-            v = (eMed * thP)[:, j]  # row 0 is this fit
+            v = modelE[:, j]  # row 0 is this fit
             print(
                 f"emissivity-prescription spread of the e(f) prediction at {f[j]:.0f} GHz: "
                 f"{100 * (v.min() / v[0] - 1):+.1f}% / {100 * (v.max() / v[0] - 1):+.1f}% relative to this fit"
@@ -438,7 +475,13 @@ def main() -> None:
         (mid, lam4F, r"$\lambda^4 F_\lambda$ [W m]"),
     ]:
         ax_.fill_between(f, g(pred["lo"]), g(pred["hi"]), alpha=0.3)
-        ax_.plot(f, g(pred["med"]), label="NEATM with e(f)")
+        ax_.plot(
+            f,
+            g(pred["med"]),
+            label="NEATM with eps_IR x e(f)"
+            if a.l5_mode == "multiplicative"
+            else "NEATM with e(f)",
+        )
         ax_.plot(f, g(const["med"]), "k--", label="NEATM with eps = 1")
         ax_.set(xscale="log", yscale="log", ylabel=label)
     if envE is not None:

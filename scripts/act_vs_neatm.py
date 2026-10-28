@@ -263,7 +263,9 @@ def sedFigure(
             f = lambdaToGHz(lam)
             inr = (lam > edge) & (f >= tail.f_ghz[0]) & (f <= tail.f_ghz[-1])
             eps = np.where(lam > edge, eps4[k, -1], eps)
-            eps[inr] = tail(lam[inr])
+            eps[inr] = tail(lam[inr]) * (
+                eps4[k, -1] if a.l5_mode == "multiplicative" else 1.0
+            )
             nanMask = (lam <= edge) | (f < tail.f_ghz[0])
         elif tail is not None:
             eps = np.where(lam > edge, tail, eps)
@@ -336,8 +338,12 @@ def sedFigure(
                 tb(np.clip(lt, C / (tb.f_ghz[-1] * 1e9), C / (tb.f_ghz[0] * 1e9))),
                 np.nan,
             )
+            epsL = epsB if a.l5_mode == "multiplicative" else 1.0
             envL = (np.full(lam.shape, np.nan), np.full(lam.shape, np.nan))
-            envL[0][tail], envL[1][tail] = (e_t * scale).min(0), (e_t * scale).max(0)
+            envL[0][tail], envL[1][tail] = (
+                (e_t * epsL * scale).min(0),
+                (e_t * epsL * scale).max(0),
+            )
         for g in [90.0, 150.0, 220.0]:
             j = np.argmin(np.abs(lt - C / (g * 1e9)))
             v = (epsB * scale)[:, j]  # row 0 is this fit
@@ -370,7 +376,8 @@ def sedFigure(
             l5med,
             c="C4",
             lw=2,
-            label=f"L5 e(f) beyond W4 ({Path(a.emissivity).stem}), 95%",
+            label=("eps_IR x L5 e(f)" if a.l5_mode == "multiplicative" else "L5 e(f)")
+            + f" beyond W4 ({Path(a.emissivity).stem}), 95%",
         )
     if envB is not None:
         ax.fill_between(
@@ -488,7 +495,7 @@ def sedFigure(
             else np.nan
         )
         print(
-            f"{pnt['label']}: implied eps = {eps:.3f} +/- {pnt['err_mJy'] * 1e-3 / float(np.median(Fa)):.3f}; L5 e = {eL5:.3f}; implied / L5 = {eps / eL5:.3f}"
+            f"{pnt['label']}: implied eps = {eps:.3f} +/- {pnt['err_mJy'] * 1e-3 / float(np.median(Fa)):.3f}; L5 eps_mm = {eL5 * (baseTail if a.l5_mode == 'multiplicative' else 1.0):.3f}; implied / L5 = {eps / (eL5 * (baseTail if a.l5_mode == 'multiplicative' else 1.0)):.3f}"
         )
     if alma:  # refresh the legend so that the ALMA entry appears
         ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2)
@@ -548,6 +555,13 @@ def main() -> None:
         type=Path,
         default=None,
         help="JSON from scripts/alma_flux.py, overlaid on the lambda^4 F_lambda SED",
+    )
+    ap.add_argument(
+        "--l5-mode",
+        choices=["multiplicative", "absolute"],
+        default="multiplicative",
+        help="multiplicative: eps_mm(nu) = eps_IR x e(nu) (e(nu) distorts the IR emissivity continued beyond W4); "
+        "absolute: eps_mm(nu) = e(nu)",
     )
     ap.add_argument(
         "--no-systematics",
@@ -612,6 +626,14 @@ def main() -> None:
         verbose=False,
     )
     post = samples.sample(a.n_draws, random_state=0)
+    # IR emissivity continued beyond W4 (distorted by e(nu) in the multiplicative mode)
+    epsTail = (
+        a.neowise_eps
+        if a.model == "neowise"
+        else epsFixed["W4"]
+        if "W4" in epsFixed
+        else float(samples["eps"].median())
+    )
     print(samples.describe().loc[["mean", "std"]].round(4), samples.attrs)
 
     # --- NEATM at every ACT observation
@@ -647,7 +669,11 @@ def main() -> None:
             for x in a.flat_eps + [eps_best]
         }
         eL5 = float(np.interp(BAND_GHZ[f], l5f, l5e)) if a.emissivity else np.nan
-        L5 = eL5 * Mmed  # NEOWISE-fit NEATM with the L5 e(f) at the band centre
+        if a.l5_mode == "multiplicative":
+            eL5 *= epsTail  # eps_mm = eps_IR x e(nu)
+        L5 = (
+            eL5 * Mmed
+        )  # NEATM (eps = 1) x the L5-distorted emissivity at the band centre
         ratioL5, ratioL5Err = (
             weightedMean(df["flux"].values / L5, df["err"].values / L5)
             if a.emissivity
@@ -674,7 +700,7 @@ def main() -> None:
                 "NEATM_draw_spread": float(eps_k.std()),
                 **{f"chi2_eps{x:g}": chi2[x] for x in a.flat_eps},
                 "chi2_best": chi2[eps_best],
-                "e_L5": eL5,
+                "eps_mm_L5": eL5,
                 "chi2_L5": float(
                     (((df["flux"].values - L5) / df["err"].values) ** 2).sum()
                 ),
@@ -715,7 +741,13 @@ def main() -> None:
         ax.plot(xs, d["eps_best"] * xs, "k--", label=f"best {d['eps_best']:.2f}")
         if a.emissivity:
             ax.plot(
-                xs, np.interp(BAND_GHZ[f], l5f, l5e) * xs, "m-", lw=2, label="L5 e(f)"
+                xs,
+                np.interp(BAND_GHZ[f], l5f, l5e)
+                * (epsTail if a.l5_mode == "multiplicative" else 1.0)
+                * xs,
+                "m-",
+                lw=2,
+                label="L5",
             )
         ax.set(
             xlabel="NEATM (eps=1) [mJy]",
