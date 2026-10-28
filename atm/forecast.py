@@ -333,6 +333,7 @@ def distinguishN(
     fTrue: float | None = None,
     covL5: np.ndarray | None = None,
     groups: list | None = None,
+    eTrue: np.ndarray | None = None,
 ) -> dict:
     """
     Expected (Asimov) test between an L5-like emissivity and a flat mm emissivity for an arbitrary set of N
@@ -362,8 +363,10 @@ def distinguishN(
         Central L5 e at each measurement's frequency.
     freqIdx : `~numpy.ndarray` (N), optional
         Index of each measurement's frequency into the rows of `covL5`.
-    truth : {"L5", "flat"}, optional
-        Which hypothesis generates the data (data = fTrue * th for "flat").
+    truth : {"L5", "flat", "template"}, optional
+        Which model generates the data: the template e0 ("L5"), a flat emissivity (data = fTrue * th), or another
+        template curve `eTrue` (data = eTrue * th, tested against the template e0). The template can be any e(nu)
+        curve, not only L5.
         [Default = "L5"]
     fTrue : float, optional
         The flat emissivity of the truth when truth == "flat".
@@ -371,6 +374,8 @@ def distinguishN(
         Covariance of the L5 e at the F distinct frequencies (nuisance of the L5 hypothesis).
     groups : list of (mask, fractional sigma), optional
         Calibration-scale nuisances: boolean mask over the N measurements and the 1-sigma fractional prior.
+    eTrue : `~numpy.ndarray` (N), optional
+        e of the generating template when truth == "template".
 
     Returns
     -------
@@ -405,7 +410,27 @@ def distinguishN(
             "significance": float(np.sqrt(max(res.fun, 0.0))),
             "dtheta": res.x[:2],
         }
-    raise ValueError("truth must be 'L5' or 'flat'")
+    if truth == "template":
+        if eTrue is None:
+            raise ValueError("eTrue is required when truth == 'template'")
+        res = _fit(
+            np.asarray(eTrue, dtype=float) * th,
+            th,
+            kernel,
+            w,
+            priorInv,
+            e0,
+            freqIdx,
+            covL5,
+            groups,
+            "L5",
+        )
+        return {
+            "dchi2": float(res.fun),
+            "significance": float(np.sqrt(max(res.fun, 0.0))),
+            "dtheta": res.x[:2],
+        }
+    raise ValueError("truth must be 'L5', 'flat' or 'template'")
 
 
 def distinguish(

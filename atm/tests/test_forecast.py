@@ -172,3 +172,26 @@ def test_l5CovarianceNuisanceIsMarginalisedOverUnusedFrequencies():
         covL5=C15[np.ix_(used, used)],
     )
     assert full["significance"] == pytest.approx(marg["significance"], rel=2e-2)
+
+
+def test_templateTruth():
+    from ..forecast import distinguishN
+
+    th, kernel = _toy()
+    T, B = th.shape
+    e0 = np.array([0.90, 0.86, 0.845, 0.88, 0.90, 0.92])
+    args = (
+        th.ravel(),
+        kernel.reshape(T * B, 2),
+        np.full(T * B, 0.5),
+        np.diag([1e-6, 1e-6]),
+        np.tile(e0, T),
+    )
+    same = distinguishN(*args, truth="template", eTrue=np.tile(e0, T))
+    assert same["significance"] == pytest.approx(0.0, abs=1e-3)
+    other = distinguishN(
+        *args, truth="template", eTrue=np.tile(e0 * np.linspace(0.8, 1.2, B), T)
+    )
+    assert other["significance"] > 5.0
+    with pytest.raises(ValueError):
+        distinguishN(*args, truth="template")
