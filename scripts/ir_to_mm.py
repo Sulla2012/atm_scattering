@@ -20,7 +20,12 @@ OBS = {"WISE": WISE, "SPHEREx": SPHEREx}
 
 
 def syntheticData(
-    model, obs, truth: np.ndarray, rel_err: float, seed: int
+    model,
+    obs,
+    truth: np.ndarray,
+    rel_err: float,
+    seed: int,
+    geometry: tuple[float, float, float],
 ) -> pd.DataFrame:
     """
     Make three epochs of fake photometry from known (logD, logT1, eps).
@@ -35,6 +40,8 @@ def syntheticData(
         Fractional flux error.
     seed : int
         Random seed.
+    geometry : tuple of float
+        r [AU], delta [AU], alpha [rad] of the first epoch; later epochs are offset slightly.
 
     Returns
     -------
@@ -42,12 +49,8 @@ def syntheticData(
         Data in the layout expected by `~atm.mmfit.fitEmcee` with columns named by `~atm.Config.columnMapping`
         (WISE) or flux_s01.. (SPHEREx).
     """
-    r, delta, alpha, G = (
-        np.array([2.0, 2.0, 2.1]),
-        np.array([1.2, 1.1, 1.0]),
-        np.array([0.4, 0.5, 0.6]),
-        0.15,
-    )
+    r, delta, alpha = (g + np.array([0.0, 0.01, 0.02]) for g in geometry)
+    G = 0.15
     model.loadLambdaTables(obs.filterQuadratureLambdas, verbose=False)
     Y = _modelFlux(model, obs, truth, r, delta, alpha, G)
     err = rel_err * Y
@@ -97,6 +100,13 @@ def main() -> None:
         default=[3.0, np.log10(300 * np.sqrt(2)), 0.9],
         help="logD logT1 eps",
     )
+    ap.add_argument(
+        "--geometry",
+        type=float,
+        nargs=3,
+        default=[2.0, 1.2, 0.4],
+        help="r [AU] delta [AU] alpha [rad]",
+    )
     ap.add_argument("--rel-err", type=float, default=0.05)
     ap.add_argument("--nsteps", type=int, default=3000)
     ap.add_argument("--n-draws", type=int, default=200)
@@ -118,7 +128,9 @@ def main() -> None:
     data = (
         pd.read_csv(a.data)
         if a.data
-        else syntheticData(model, obs, np.array(a.truth), a.rel_err, 0)
+        else syntheticData(
+            model, obs, np.array(a.truth), a.rel_err, 0, tuple(a.geometry)
+        )
     )
     samples = fitEmcee(
         model,
