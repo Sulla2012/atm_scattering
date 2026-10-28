@@ -107,3 +107,4 @@ data/act/
 data/mm_tables/
 data/so_forecast/
 data/act_flora/
+data/emissivity/*.npz
