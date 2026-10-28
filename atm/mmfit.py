@@ -43,9 +43,27 @@ def fluxLambdaToJy(flux: np.ndarray, lambd: np.ndarray) -> np.ndarray:
     return flux * np.asarray(lambd) ** 2 / c * 1e26
 
 
-def _modelFlux(model, obs, theta: np.ndarray, r, delta, alpha, G) -> np.ndarray:
+def _epsPerFilter(obs, eps: float, epsFixed: dict | None) -> np.ndarray:
     """
-    IR model flux (thermal plus reflected) for parameters theta = (logD, logT1, eps).
+    Emissivity for each filter: `eps` for every filter not listed in `epsFixed`.
+
+    Returns
+    -------
+    `~numpy.ndarray` (M)
+    """
+    values = np.full(len(obs.filterNames), float(eps))
+    for name, value in (epsFixed or {}).items():
+        values[obs.filterNames.index(name)] = value
+    return values
+
+
+def _modelFlux(
+    model, obs, theta: np.ndarray, r, delta, alpha, G, epsFixed: dict | None = None
+) -> np.ndarray:
+    """
+    IR model flux (thermal plus reflected) for parameters theta = (logD, logT1, eps). Filters in
+    `epsFixed` use their fixed emissivity instead of eps; each filter's albedo follows Kirchhoff,
+    p = (1 - eps) / Q.
 
     Returns
     -------
@@ -53,6 +71,11 @@ def _modelFlux(model, obs, theta: np.ndarray, r, delta, alpha, G) -> np.ndarray:
         Flux in W m^-3 for N observations by M filters.
     """
     logD, logT1, eps = theta
+    r, delta, alpha = (np.atleast_1d(x) for x in (r, delta, alpha))
+    epsF = _epsPerFilter(obs, eps, epsFixed)
+    # WISE-style bandpassLambda returns (M, N), SPHEREx-style (N, M); eps broadcasts along filters
+    wiseLike = obs.acronym != "SPHEREx"
+    e = epsF[:, None] if wiseLike else epsF
     flux = interpFluxLambdaObsWithSunlight(
         model,
         obs,
@@ -61,15 +84,11 @@ def _modelFlux(model, obs, theta: np.ndarray, r, delta, alpha, G) -> np.ndarray:
         10**logT1 / np.sqrt(r),
         10**logD,
         alpha,
-        eps,
-        (1 - eps) / calcQ(G),
+        e,
+        (1 - e) / calcQ(G),
         G,
     )
-    return (
-        flux.reshape(len(np.atleast_1d(r)), -1)
-        if flux.shape[0] != len(np.atleast_1d(r))
-        else flux
-    )
+    return flux.T if wiseLike else flux
 
 
 def fitEmcee(
@@ -78,6 +97,7 @@ def fitEmcee(
     data: pd.DataFrame,
     columnMapping: dict = Config.columnMapping,
     parameterPriors: dict = Config.parameterPriors,
+    epsFixed: dict | None = None,
     nwalkers: int = 32,
     nsteps: int = 3000,
     burnIn: int = 1000,
@@ -104,6 +124,9 @@ def fitEmcee(
     parameterPriors : dict, optional
         Uniform bounds ("lower", "upper") for logD, logT1 and eps.
         [Default = `~atm.Config.parameterPriors`]
+    epsFixed : dict, optional
+        Filter name -> fixed emissivity (e.g. {"W3": 0.8, "W4": 0.98}, as in the paper1 runs). All other
+        filters share the fitted eps, and every filter's albedo follows Kirchhoff.
     nwalkers : int, optional
         Number of emcee walkers.
     nsteps : int, optional
@@ -144,7 +167,10 @@ def fitEmcee(
             return np.inf
         return float(
             (
-                ((Y - _modelFlux(model, obs, theta, r, delta, alpha, G)) / Y_err)[good]
+                (
+                    (Y - _modelFlux(model, obs, theta, r, delta, alpha, G, epsFixed))
+                    / Y_err
+                )[good]
                 ** 2
             ).sum()
         )

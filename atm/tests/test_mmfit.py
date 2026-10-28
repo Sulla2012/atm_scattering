@@ -61,3 +61,29 @@ def test_nanFluxIgnored(synthetic):
         verbose=False,
     )
     assert s.attrs["ndata"] == 11
+
+
+def test_modelFluxMatchesSingleEpoch(synthetic):
+    """Each epoch/band of _modelFlux must equal the model evaluated for that epoch alone."""
+    model, obs, _, _ = synthetic
+    r, delta, alpha = (
+        np.array([2.0, 2.2, 2.4]),
+        np.array([1.2, 1.4, 1.6]),
+        np.array([0.1, 0.3, 0.5]),
+    )
+    all_ = _modelFlux(model, obs, TRUTH, r, delta, alpha, 0.15)
+    assert all_.shape == (3, 4)
+    for i in range(3):
+        one = _modelFlux(
+            model, obs, TRUTH, r[i : i + 1], delta[i : i + 1], alpha[i : i + 1], 0.15
+        )
+        np.testing.assert_allclose(all_[i], one[0])
+
+
+def test_epsFixedChangesOnlyThoseBands(synthetic):
+    model, obs, _, _ = synthetic
+    r, delta, alpha = np.array([2.0]), np.array([1.2]), np.array([0.3])
+    base = _modelFlux(model, obs, TRUTH, r, delta, alpha, 0.15)
+    fixed = _modelFlux(model, obs, TRUTH, r, delta, alpha, 0.15, {"W4": 0.5})
+    np.testing.assert_allclose(base[0, :3], fixed[0, :3])
+    assert not np.isclose(base[0, 3], fixed[0, 3], rtol=1e-3, atol=0)

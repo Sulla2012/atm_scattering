@@ -1,6 +1,7 @@
 """Fit IR photometry (WISE or SPHEREx) with NEATM and predict the mm spectrum with Meteorites-TeraFlash e(f)."""
 
 import argparse
+import sqlite3
 from pathlib import Path
 
 import matplotlib
@@ -10,6 +11,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 
+from atm import modifyErrors
 from atm.config import Config
 from atm.constants import Constants
 from atm.functions.emissivity import EmissivityTable, ghzToLambda
@@ -71,12 +73,70 @@ def syntheticData(
     return df
 
 
+def loadWiseFromDb(db: Path, designation: str, sigma: float, obs: WISE) -> pd.DataFrame:
+    """
+    Load clipped WISE observations of one object from an atm_data sample database, following
+    the paper1 procedure (keep == 1, then `~atm.modifyErrors` adds sigma magnitudes of error).
+
+    Parameters
+    ----------
+    db : `~pathlib.Path`
+        sqlite database with an `observations` table (e.g. atm_data/paper1/sample.db).
+    designation : str
+        Object designation as stored in the database (e.g. "4" for Vesta).
+    sigma : float
+        Magnitude error added in quadrature-free offset form by `~atm.modifyErrors`.
+    obs : `~atm.obs.WISE`
+        Observatory used to convert the magnitude errors to flux errors.
+
+    Returns
+    -------
+    `~pandas.DataFrame`
+        Observations with an `alpha_rad` column.
+    """
+    with sqlite3.connect(f"file:{db}?mode=ro", uri=True) as con:
+        df = pd.read_sql(
+            "SELECT * FROM observations WHERE designation = ? AND keep = 1",
+            con,
+            params=(designation,),
+        )
+    if df.empty:
+        raise ValueError(f"No kept observations of {designation} in {db}")
+    df = modifyErrors(df, obs, sigma=sigma)
+    df["alpha_rad"] = np.radians(df["alpha_deg"])
+    return df
+
+
 def main() -> None:
     """Parse the CLI, run the fit, predict the mm spectrum and write figures plus an HTML report."""
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--obs", choices=list(OBS), default="WISE")
     ap.add_argument(
         "--data", type=Path, default=None, help="CSV of real data; default: synthetic"
+    )
+    ap.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        help="atm_data sample.db (WISE only); needs --designation",
+    )
+    ap.add_argument(
+        "--designation",
+        default=None,
+        help='object designation in the db, e.g. "4" for Vesta',
+    )
+    ap.add_argument(
+        "--sigma",
+        type=float,
+        default=0.10,
+        help="magnitude error added to db photometry",
+    )
+    ap.add_argument(
+        "--eps-fixed",
+        nargs="+",
+        default=[],
+        metavar="BAND=EPS",
+        help="fixed IR emissivity per band, e.g. W3=0.8 W4=0.98 (paper1 run4a); other bands share the fitted eps",
     )
     ap.add_argument(
         "--emissivity",
@@ -128,17 +188,21 @@ def main() -> None:
         [f"fluxErr_{n}_si" for n in names],
     )
     data = (
-        pd.read_csv(a.data)
+        loadWiseFromDb(a.db, a.designation, a.sigma, obs)
+        if a.db
+        else pd.read_csv(a.data)
         if a.data
         else syntheticData(
             model, obs, np.array(a.truth), a.rel_err, 0, tuple(a.geometry)
         )
     )
+    epsFixed = {k: float(v) for k, v in (x.split("=") for x in a.eps_fixed)}
     samples = fitEmcee(
         model,
         obs,
         data,
         columnMapping=cm,
+        epsFixed=epsFixed,
         nsteps=a.nsteps,
         burnIn=a.nsteps // 3,
         verbose=False,
@@ -181,7 +245,8 @@ def main() -> None:
         obs,
         np.array([logD, logT1, eps]),
         *(data[cm[k]].values.astype(float) for k in ["r_au", "delta_au", "alpha_rad"]),
-        0.15,
+        float(data[cm["G"]].iloc[0]),
+        epsFixed,
     )
     ax[0].plot(lam * 1e6, fluxLambdaToJy(best[0], lam), "-")
     ax[0].set(
