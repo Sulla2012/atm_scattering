@@ -17,7 +17,10 @@ from astropy.io import fits
 from astropy.time import Time
 from astroquery.jplhorizons import Horizons
 
+from atm.config import Config
 from atm.constants import Constants
+from atm.functions.hg import calcHG, calcQ
+from atm.functions.flux_lambda import calcFluxLambdaSun
 from atm.functions.emissivity import ghzGridToLambda, ghzListToLambda, lambdaToGHz
 from atm.functions.interpolate_flux_lambda import interpFluxLambdaAtObs
 from atm.mmfit import checkTableRange, fitEmcee, fluxLambdaToJy, loadWiseFromDb
@@ -166,6 +169,166 @@ def weightedMean(x: np.ndarray, err: np.ndarray) -> tuple[float, float]:
     return float((x * w).sum() / w.sum()), float(w.sum() ** -0.5)
 
 
+def sedFigure(
+    model: NEATM,
+    obs: WISE,
+    wise: pd.DataFrame,
+    samples: pd.DataFrame,
+    epsFixed: dict,
+    stack: list,
+    a,
+) -> None:
+    """
+    Figure-3-style SED (Orlowski-Scherer et al. 2024): lambda^4 F_lambda of the NEATM model fit to the WISE
+    bands, with the ACT stacked fluxes (inverse-variance combined F_0 of every observation, scaled with
+    F_i = F_0 W_i, W_i = d_earth^-2 d_sun^-1/2 10^(-0.004 alpha), to the geometry of the WISE observations).
+
+    The model emissivity is interpolated between the WISE bands (fitted eps for W1/W2, then the fixed W3 and W4
+    values) and held at the W4 value beyond it; dashed curves instead hold a flat eps beyond W4.
+
+    Parameters
+    ----------
+    model : `~atm.models.NEATM`
+        Model used for direct integration (no tables).
+    obs : `~atm.obs.WISE`
+        Observatory.
+    wise : `~pandas.DataFrame`
+        WISE observations used in the fit (with alpha_rad).
+    samples : `~pandas.DataFrame`
+        Posterior samples from `~atm.mmfit.fitEmcee`.
+    epsFixed : dict
+        Fixed per-band emissivities used in the fit.
+    stack : list of dict
+        ACT stacked points with keys array, GHz, F0 [mJy at 1 AU / 1 AU / alpha = 0] and err.
+    a : `~argparse.Namespace`
+        Parsed CLI arguments (out, flat_eps, n_sed_draws, threads, sys_err).
+    """
+    cm = Config.columnMapping
+    r0, d0, al0 = (
+        float(wise[cm[k]].median()) for k in ["r_au", "delta_au", "alpha_rad"]
+    )
+    G = float(wise[cm["G"]].iloc[0])
+    lam = np.logspace(-6, -2, 60)
+    post = samples.sample(a.n_sed_draws, random_state=1)
+    T = 10 ** post["logT1"].values / np.sqrt(r0)
+    th = model.calcTotalFluxLambdaEmittedToObsMany(
+        np.tile(lam, len(T)),
+        np.repeat(T, len(lam)),
+        np.full(len(T) * len(lam), al0),
+        threads=a.threads,
+    ).reshape(len(T), len(lam))
+    eps4 = np.array(
+        [
+            [
+                post["eps"].values[k] if n not in epsFixed else epsFixed[n]
+                for n in obs.filterNames
+            ]
+            for k in range(len(T))
+        ]
+    )
+    effL = obs.filterEffectiveLambdas
+
+    def flux(k: int, tail: float | None) -> np.ndarray:
+        """lambda^4 F_lambda [W m] for draw k; eps beyond W4 is `tail` (None: the W4 value)."""
+        eps = np.interp(lam, effL, eps4[k])
+        if tail is not None:
+            eps = np.where(lam > effL[-1], tail, eps)
+        p = (1 - eps) / calcQ(G)
+        D = 10 ** post["logD"].values[k]
+        F = (
+            D**2
+            / (4 * d0**2 * AU**2)
+            * (eps * th[k] + p * calcHG(al0, G) * calcFluxLambdaSun(lam, r0))
+        )
+        return F * lam**4
+
+    fig, ax = plt.subplots(figsize=(8, 5.5))
+    base = np.array([flux(k, None) for k in range(len(T))])
+    lo, med, hi = np.percentile(base, [2.5, 50, 97.5], axis=0)
+    ax.fill_between(lam * 1e6, lo, hi, alpha=0.25, color="C0")
+    ax.plot(
+        lam * 1e6,
+        med,
+        c="C0",
+        label=f"NEATM fit to WISE (eps beyond W4 = {eps4[:, -1].mean():.2f}), 95%",
+    )
+    for i, x in enumerate(a.flat_eps[1:], start=1):
+        ax.plot(
+            lam * 1e6,
+            np.median([flux(k, x) for k in range(len(T))], axis=0),
+            ls="--",
+            c=f"C{i}",
+            label=f"flat eps = {x:g} beyond W4",
+        )
+    for j, n in enumerate(obs.filterNames):
+        w, e = wise[cm["flux_si"][j]], wise[cm["fluxErr_si"][j]]
+        ax.errorbar(
+            np.full(len(w), effL[j] * 1e6),
+            w * effL[j] ** 4,
+            e * effL[j] ** 4,
+            fmt="o",
+            c="k",
+            ms=3,
+            label="WISE" if j == 0 else None,
+        )
+    Wgeo = d0**-2 * r0**-0.5 * 10 ** (-0.004 * np.degrees(al0))
+    sysErr = {98.0: 0.014, 150.0: 0.014, 220.0: 0.018}
+    markers = {"pa4": "s", "pa5": "o", "pa6": "^"}
+    zoom, labelled = [], set()
+    for pnt in stack:
+        nu = pnt["GHz"] * 1e9
+        lm = 299792458.0 / nu
+        y = pnt["F0"] * Wgeo * 1e-29 * 299792458.0 * lm**2
+        ye = (
+            np.hypot(pnt["err"], sysErr[pnt["GHz"]] * pnt["F0"])
+            * Wgeo
+            * 1e-29
+            * 299792458.0
+            * lm**2
+        )
+        ax.errorbar(
+            lm * 1e6,
+            y,
+            ye,
+            fmt=markers[pnt["array"]],
+            c="r",
+            ms=5,
+            label=f"ACT {pnt['array']}" if pnt["array"] not in labelled else None,
+        )
+        labelled.add(pnt["array"])
+        zoom.append((lm * 1e6, y, ye, markers[pnt["array"]]))
+    ax.set(
+        xscale="log",
+        yscale="log",
+        xlabel=r"Wavelength [$\mu$m]",
+        ylabel=r"$\lambda^4 F_\lambda$ [W m]",
+        xlim=(0.7, 2e4),
+    )
+    ax.set_title(
+        f"{a.asteroid}: r={r0:.2f} AU, delta={d0:.2f} AU, alpha={np.degrees(al0):.0f} deg (WISE geometry)",
+        fontsize=9,
+    )
+    ax.legend(fontsize=7, loc="lower left")
+    ins = ax.inset_axes([0.45, 0.08, 0.52, 0.4])
+    ins.fill_between(lam * 1e6, lo, hi, alpha=0.25, color="C0")
+    ins.plot(lam * 1e6, med, c="C0")
+    for i, x in enumerate(a.flat_eps[1:], start=1):
+        ins.plot(
+            lam * 1e6,
+            np.median([flux(k, x) for k in range(len(T))], axis=0),
+            ls="--",
+            c=f"C{i}",
+        )
+    for x, y, ye, m in zoom:
+        ins.errorbar(x, y, ye, fmt=m, c="r", ms=4)
+    ins.set(xlim=(1.1e3, 3.4e3))
+    ymin = min(y - ye for _, y, ye, _ in zoom)
+    ins.set_ylim(0.8 * ymin, 1.2 * hi[(lam * 1e6 > 1.1e3) & (lam * 1e6 < 3.4e3)].max())
+    ins.tick_params(labelsize=6)
+    fig.tight_layout()
+    fig.savefig(a.out / "act_sed_lambda4.png", dpi=110)
+
+
 def main() -> None:
     """Parse the CLI, run the WISE fit, compare with ACT and write the figures and report."""
     ap = argparse.ArgumentParser(description=__doc__)
@@ -188,6 +351,13 @@ def main() -> None:
     )
     ap.add_argument("--flat-eps", type=float, nargs="+", default=[1.0, 0.9, 0.8])
     ap.add_argument("--n-draws", type=int, default=100)
+    ap.add_argument(
+        "--n-sed-draws",
+        type=int,
+        default=30,
+        help="posterior draws for the direct-integration SED band",
+    )
+    ap.add_argument("--threads", type=int, default=8)
     ap.add_argument("--nsteps", type=int, default=3000)
     ap.add_argument("--out", type=Path, default=Path("reports/act_vesta"))
     ap.add_argument(
@@ -195,7 +365,7 @@ def main() -> None:
     )
     a = ap.parse_args()
     if a.debug:
-        a.n_draws, a.nsteps = 10, 500
+        a.n_draws, a.nsteps, a.n_sed_draws = 10, 500, 3
     a.out.mkdir(parents=True, exist_ok=True)
     a.cache_dir.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(a.astronaut_dir))
@@ -245,7 +415,7 @@ def main() -> None:
     tabModel.loadLambdaTables(
         np.unique(np.concatenate([gridLam, list(lams.values())])), verbose=False
     )
-    rows, res = [], {}
+    rows, res, stack = [], {}, []
     for (arr, f), df in act.items():
         e = eph.loc[jd[(arr, f)]]
         r, delta, alpha = (
@@ -268,10 +438,11 @@ def main() -> None:
         ref = get_ast_weighted_flux(a.asteroid, arr, f)[
             0
         ]  # ASTRONAUT's weighted flux, scaled to 1 AU / 1 AU / alpha = 0
-        mine = weightedMean(
+        mine, mineErr = weightedMean(
             df["flux"].values * df["weight"].values,
             df["err"].values * df["weight"].values,
-        )[0]
+        )
+        stack.append({"array": arr, "GHz": BAND_GHZ[f], "F0": mine, "err": mineErr})
         res[(arr, f)] = dict(
             df=df, M=M, Mmed=Mmed, geom=(r, delta, alpha), eps_best=eps_best
         )
@@ -380,11 +551,12 @@ def main() -> None:
     ax[1].legend()
     fig.tight_layout()
     fig.savefig(a.out / "act_vs_neatm_sed.png", dpi=100)
+    sedFigure(model, obs, wise, samples, epsFixed, stack, a)
     html = (
         f"<h1>{a.asteroid}: ACT vs NEATM (flat emissivity)</h1>"
         f"<p>NEATM fit to WISE: logD = {samples['logD'].median():.3f}, logT1 = {samples['logT1'].median():.3f}, "
         f"chi2 = {samples.attrs['chi2_best']:.1f} / {samples.attrs['ndata']}. Band centres are nominal; no colour correction.</p>"
-        f'<img src="act_vs_neatm_sed.png"><img src="act_vs_neatm_scatter.png">{table.round(3).to_html(index=False)}'
+        f'<img src="act_sed_lambda4.png"><img src="act_vs_neatm_sed.png"><img src="act_vs_neatm_scatter.png">{table.round(3).to_html(index=False)}'
     )
     (a.out / "act_vs_neatm.html").write_text(html)
     print(a.out / "act_vs_neatm.html")
