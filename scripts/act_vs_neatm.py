@@ -359,7 +359,9 @@ def sedFigure(
         label=("NEOWISE NEATM fit to WISE" if neowise else "NEATM fit to WISE")
         + f" (eps beyond W4 = {baseTail:.2f}), 95%",
     )
-    flats = [x for x in a.flat_eps if abs(x - baseTail) > 1e-9]
+    flats = (  # dashed flat-eps lines beyond W4 are only drawn on request
+        [x for x in a.flat_eps if abs(x - baseTail) > 1e-9] if a.show_flat else []
+    )
     for i, x in enumerate(flats, start=1):
         ax.plot(
             lam * 1e6,
@@ -562,6 +564,11 @@ def main() -> None:
         default="multiplicative",
         help="multiplicative: eps_mm(nu) = eps_IR x e(nu) (e(nu) distorts the IR emissivity continued beyond W4); "
         "absolute: eps_mm(nu) = e(nu)",
+    )
+    ap.add_argument(
+        "--show-flat",
+        action="store_true",
+        help="also draw dashed flat-emissivity lines (--flat-eps) beyond W4 on the lambda^4 F_lambda SED",
     )
     ap.add_argument(
         "--no-systematics",
