@@ -196,10 +196,30 @@ def main() -> None:
     ax[2].legend()
     fig.tight_layout()
     fig.savefig(a.out / f"ir_to_mm_{a.obs}.png", dpi=100)
+    sed, (top, bot) = plt.subplots(
+        2, 1, figsize=(7, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]}
+    )
+
+    def nuF(F: np.ndarray) -> np.ndarray:
+        """nu F_nu [W m^-2] from F_nu [Jy] at the frequencies f [GHz]."""
+        return F * f * 1e9 * 1e-26
+
+    top.fill_between(f, nuF(pred["lo"]), nuF(pred["hi"]), alpha=0.3)
+    top.plot(f, nuF(pred["med"]), label="NEATM with e(f)")
+    top.plot(f, nuF(const["med"]), "k--", label="NEATM with eps = 1")
+    top.set(xscale="log", yscale="log", ylabel=r"$\nu F_\nu$ [W m$^{-2}$]")
+    top.legend()
+    ratio = pred["F_nu"] / const["F_nu"]
+    bot.fill_between(f, *np.percentile(ratio, [16, 84], axis=0), alpha=0.3)
+    bot.plot(f, np.median(ratio, axis=0))
+    bot.axhline(1, c="k", ls="--")
+    bot.set(xlabel="GHz", ylabel="e(f) / (eps = 1)")
+    sed.tight_layout()
+    sed.savefig(a.out / f"ir_to_mm_{a.obs}_sed.png", dpi=100)
     html = (
         f"<h2>IR to mm: {a.obs}</h2><p>emissivity: {a.emissivity.name}; acceptance {samples.attrs['acceptance']:.2f}; "
         f"best chi2 = {samples.attrs['chi2_best']:.1f} for {samples.attrs['ndata']} points.</p>"
-        f'<img src="ir_to_mm_{a.obs}.png"><pre>{samples.describe().loc[["mean", "std"]].round(4)}</pre>'
+        f'<img src="ir_to_mm_{a.obs}.png"><img src="ir_to_mm_{a.obs}_sed.png"><pre>{samples.describe().loc[["mean", "std"]].round(4)}</pre>'
     )
     (a.out / f"ir_to_mm_{a.obs}.html").write_text(html)
     print(a.out / f"ir_to_mm_{a.obs}.html")
