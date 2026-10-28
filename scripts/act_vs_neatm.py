@@ -33,6 +33,7 @@ from atm.functions.interpolate_flux_lambda import interpFluxLambdaAtObs
 from atm.mmfit import (
     checkTableRange,
     fitEmcee,
+    fitPrescriptions,
     fluxLambdaToJy,
     loadWiseFromDb,
     thermalFluxJy,
@@ -41,6 +42,7 @@ from atm.models import NEATM
 from atm.obs import WISE
 
 AU = Constants.ASTRONOMICAL_UNIT
+C = Constants.LIGHTSPEED
 BUCKET = "s3://cornell-acteroids/"
 ARRAYS = ["pa4", "pa5", "pa6"]
 FREQS = ["090", "150", "220"]
@@ -192,6 +194,7 @@ def sedFigure(
     stack: list,
     a,
     alma: list | None = None,
+    presc: list | None = None,
 ) -> None:
     """
     Figure-3-style SED (Orlowski-Scherer et al. 2024): lambda^4 F_lambda of the NEATM model fit to the WISE
@@ -290,6 +293,58 @@ def sedFigure(
     fig, ax = plt.subplots(figsize=(8, 5.5))
     base = np.array([flux(k, None) for k in range(len(T))])
     lo, med, hi = np.percentile(base, [2.5, 50, 97.5], axis=0)
+    # Spread of the prediction under different emissivity prescriptions (fits of the same data); the formal
+    # posterior of one fit does not include the uncertainty of eps(lambda). Evaluated beyond W4 only.
+    envB = envL = None
+    if presc:
+        fits = [
+            {
+                "name": "this fit",
+                "logD": float(post["logD"].median()),
+                "logT1": float(post["logT1"].median()),
+                "eps_tail": baseTail,
+            }
+        ] + presc
+        tail = lam > edge
+        lt = lam[tail]
+        thP = np.array(
+            [
+                model.calcTotalFluxLambdaEmittedToObsMany(
+                    lt,
+                    np.full(len(lt), 10 ** q["logT1"] / np.sqrt(r0)),
+                    np.full(len(lt), al0),
+                    threads=a.threads,
+                )
+                for q in fits
+            ]
+        )
+        scale = (
+            np.array([10 ** (2 * q["logD"]) / (4 * d0**2 * AU**2) for q in fits])[
+                :, None
+            ]
+            * thP
+            * lt**4
+        )
+        epsB = np.array([q["eps_tail"] for q in fits])[:, None]
+        envB = (np.full(lam.shape, np.nan), np.full(lam.shape, np.nan))
+        envB[0][tail], envB[1][tail] = (epsB * scale).min(0), (epsB * scale).max(0)
+        if a.emissivity:
+            tb = EmissivityTable.fromNpz(a.emissivity, draw="median")
+            f_t = lambdaToGHz(lt)
+            e_t = np.where(
+                (f_t >= tb.f_ghz[0]) & (f_t <= tb.f_ghz[-1]),
+                tb(np.clip(lt, C / (tb.f_ghz[-1] * 1e9), C / (tb.f_ghz[0] * 1e9))),
+                np.nan,
+            )
+            envL = (np.full(lam.shape, np.nan), np.full(lam.shape, np.nan))
+            envL[0][tail], envL[1][tail] = (e_t * scale).min(0), (e_t * scale).max(0)
+        for g in [90.0, 150.0, 220.0]:
+            j = np.argmin(np.abs(lt - C / (g * 1e9)))
+            v = (epsB * scale)[:, j]  # row 0 is this fit
+            print(
+                f"emissivity-prescription spread of the baseline prediction at {g:.0f} GHz: "
+                f"{100 * (v.min() / v[0] - 1):+.1f}% / {100 * (v.max() / v[0] - 1):+.1f}% relative to this fit"
+            )
     ax.fill_between(lam * 1e6, lo, hi, alpha=0.25, color="C0")
     ax.plot(
         lam * 1e6,
@@ -316,6 +371,26 @@ def sedFigure(
             c="C4",
             lw=2,
             label=f"L5 e(f) beyond W4 ({Path(a.emissivity).stem}), 95%",
+        )
+    if envB is not None:
+        ax.fill_between(
+            lam * 1e6,
+            *envB,
+            facecolor="none",
+            edgecolor="0.35",
+            hatch="///",
+            lw=0,
+            label="emissivity-prescription spread",
+        )
+    if envL is not None:
+        ax.fill_between(
+            lam * 1e6,
+            *envL,
+            facecolor="none",
+            edgecolor="C4",
+            hatch="\\\\",
+            lw=0,
+            label="same, with L5 e(f)",
         )
     for j, n in enumerate(
         obs.filterNames
@@ -369,6 +444,14 @@ def sedFigure(
     ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2)
     ins = ax.inset_axes([0.45, 0.08, 0.52, 0.4])
     ins.fill_between(lam * 1e6, lo, hi, alpha=0.25, color="C0")
+    if envB is not None:
+        ins.fill_between(
+            lam * 1e6, *envB, facecolor="none", edgecolor="0.35", hatch="///", lw=0
+        )
+    if envL is not None:
+        ins.fill_between(
+            lam * 1e6, *envL, facecolor="none", edgecolor="C4", hatch="\\\\", lw=0
+        )
     ins.plot(lam * 1e6, med, c="C0")
     for i, x in enumerate(flats, start=1):
         ins.plot(
@@ -465,6 +548,11 @@ def main() -> None:
         type=Path,
         default=None,
         help="JSON from scripts/alma_flux.py, overlaid on the lambda^4 F_lambda SED",
+    )
+    ap.add_argument(
+        "--no-systematics",
+        action="store_true",
+        help="skip the emissivity-prescription fits (envelope on the SED)",
     )
     ap.add_argument(
         "--n-sed-draws",
@@ -705,7 +793,20 @@ def main() -> None:
     fig.tight_layout()
     fig.savefig(a.out / "act_vs_neatm_sed.png", dpi=100)
     alma = json.loads(a.alma_json.read_text()) if a.alma_json else []
-    sedFigure(model, obs, wise, samples, epsFixed, stack, a, alma)
+    presc = (
+        None
+        if a.no_systematics
+        else fitPrescriptions(model, obs, wise, Config.columnMapping)
+    )
+    if presc:
+        print(
+            "prescription fits:",
+            [
+                (q["name"], round(10 ** q["logD"] / 1e3, 1), round(q["chi2"]))
+                for q in presc
+            ],
+        )
+    sedFigure(model, obs, wise, samples, epsFixed, stack, a, alma, presc)
     html = (
         f"<h1>{a.asteroid}: ACT vs NEATM (flat emissivity)</h1>"
         f"<p>NEATM fit to WISE: logD = {samples['logD'].median():.3f}, logT1 = {samples['logT1'].median():.3f}, "

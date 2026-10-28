@@ -18,6 +18,8 @@ from atm.functions.emissivity import EmissivityTable, ghzToLambda
 from atm.mmfit import (
     _modelFlux,
     fitEmcee,
+    fitPrescriptions,
+    prescriptionFluxJy,
     fluxLambdaToJy,
     loadWiseFromDb,
     predictMm,
@@ -222,6 +224,11 @@ def main() -> None:
         "with the NEATM model, so its ratio to NEATM(eps = 1) is the exact implied emissivity)",
     )
     ap.add_argument(
+        "--no-systematics",
+        action="store_true",
+        help="skip the emissivity-prescription fits (WISE only), which add the systematic spread to the SED",
+    )
+    ap.add_argument(
         "--threads", type=int, default=8, help="processes for direct NEATM integrations"
     )
     ap.add_argument("--debug", action="store_true", help="short chain, 20 draws")
@@ -263,6 +270,17 @@ def main() -> None:
         verbose=False,
     )
     print(samples.describe().loc[["mean", "std"]], samples.attrs)
+    # same data fitted under other emissivity prescriptions: systematic spread of the prediction
+    presc = (
+        fitPrescriptions(model, obs, data, cm)
+        if a.obs == "WISE" and not a.no_systematics
+        else None
+    )
+    fits = (
+        [{"name": "this fit", **samples[["logD", "logT1"]].median().to_dict()}] + presc
+        if presc
+        else []
+    )
 
     # mm prediction at the nominal geometry of the first epoch
     f_all = np.arange(a.fmin, a.fmax + a.df / 2, a.df)
@@ -309,6 +327,34 @@ def main() -> None:
             pnt
         ) in act:  # model at eps = 1 and the implied flat emissivity at each ACT point
             pnt["model"] = float(constAct[list(fAct).index(pnt["GHz"])])
+
+    geom = (r, delta, alpha)
+    envE = None
+    if fits:
+        lamF = ghzToLambda(f)
+        eMed = EmissivityTable.fromNpz(a.emissivity, draw="median")(lamF)
+        thP = np.array(
+            [
+                [prescriptionFluxJy(model, lm_, q, geom, a.threads) for lm_ in lamF]
+                for q in fits
+            ]
+        )
+        envE = ((eMed * thP).min(0), (eMed * thP).max(0))  # e(f) prediction (Jy)
+        for g in (100.0, 150.0, 225.0):
+            j = int(np.argmin(np.abs(f - g)))
+            v = (eMed * thP)[:, j]  # row 0 is this fit
+            print(
+                f"emissivity-prescription spread of the e(f) prediction at {f[j]:.0f} GHz: "
+                f"{100 * (v.min() / v[0] - 1):+.1f}% / {100 * (v.max() / v[0] - 1):+.1f}% relative to this fit"
+            )
+
+    def ratioRange(F_Jy: float, ghz: float, g: tuple) -> tuple[float, float]:
+        """Range of data / thermal-model over the emissivity prescriptions."""
+        v = [
+            F_Jy / prescriptionFluxJy(model, c / (ghz * 1e9), q, g, a.threads)
+            for q in fits
+        ]
+        return min(v), max(v)
 
     alma = []
     if a.alma_json:
@@ -395,8 +441,23 @@ def main() -> None:
         ax_.plot(f, g(pred["med"]), label="NEATM with e(f)")
         ax_.plot(f, g(const["med"]), "k--", label="NEATM with eps = 1")
         ax_.set(xscale="log", yscale="log", ylabel=label)
+    if envE is not None:
+        for ax_, g in [(top, nuF), (mid, lam4F)]:
+            ax_.fill_between(
+                f,
+                g(envE[0]),
+                g(envE[1]),
+                facecolor="none",
+                edgecolor="0.35",
+                hatch="///",
+                lw=0,
+                label="emissivity-prescription spread",
+            )
     markers = {"pa4": "s", "pa5": "o", "pa6": "^"}
     for pnt in act:
+        if fits:
+            lo_, hi_ = ratioRange(pnt["F_mJy"] * 1e-3, pnt["GHz"], geom)
+            bot.vlines(pnt["GHz"], lo_, hi_, color="0.6", lw=7, alpha=0.5, zorder=0)
         nu, lm = pnt["GHz"] * 1e9, c / (pnt["GHz"] * 1e9)
         y, ye = pnt["F_mJy"] * 1e-29, pnt["err_mJy"] * 1e-29  # W m^-2 Hz^-1
         for ax_, scale in [(top, nu), (mid, c * lm**2)]:
@@ -420,6 +481,13 @@ def main() -> None:
             else None,
         )
     for pnt in alma:
+        if fits:
+            lo_, hi_ = ratioRange(
+                pnt["F_mJy"] * 1e-3,
+                pnt["GHz"],
+                (pnt["r_au"], pnt["delta_au"], pnt["alpha_rad"]),
+            )
+            bot.vlines(pnt["GHz"], lo_, hi_, color="0.6", lw=7, alpha=0.5, zorder=0)
         nu, lm = pnt["GHz"] * 1e9, c / (pnt["GHz"] * 1e9)
         y, ye = pnt["F_ref_Jy"] * 1e-26, pnt["err_ref_Jy"] * 1e-26
         for ax_, scale in [(top, nu), (mid, c * lm**2)]:

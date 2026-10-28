@@ -23,7 +23,10 @@ __all__ = [
     "checkTableRange",
     "fitEmcee",
     "fluxLambdaToJy",
+    "PRESCRIPTIONS",
+    "fitPrescriptions",
     "loadWiseFromDb",
+    "prescriptionFluxJy",
     "thermalFluxJy",
     "predictMm",
 ]
@@ -156,6 +159,110 @@ def thermalFluxJy(
     return fluxLambdaToJy(
         10 ** (2 * post["logD"].values) / (4 * delta**2 * AU**2) * th, lambd
     )
+
+
+# Emissivity prescriptions for the WISE fit (Moeyens et al. 2020, Sec. 2.4; paper1 runs): each is a set of keyword
+# arguments for `fitEmcee`. The emissivity continued beyond W4 (to the mm) is the fixed W4 value.
+PRESCRIPTIONS = {
+    "NEOWISE eps=0.8": {"neowise": {"eps": 0.8, "bands": ["W1", "W2"]}},
+    "NEOWISE eps=1.0": {"neowise": {"eps": 1.0, "bands": ["W1", "W2"]}},
+    "eps_W3,W4=0.80,0.98": {"epsFixed": {"W3": 0.8, "W4": 0.98}},
+    "eps_W3,W4=0.76,0.93": {"epsFixed": {"W3": 0.76, "W4": 0.93}},
+    "eps_W3,W4=0.70,0.86": {"epsFixed": {"W3": 0.7, "W4": 0.86}},
+    "eps_W3,W4=0.90,0.90": {"epsFixed": {"W3": 0.9, "W4": 0.9}},
+}
+
+
+def fitPrescriptions(
+    model,
+    obs,
+    data: pd.DataFrame,
+    columnMapping: dict = Config.columnMapping,
+    prescriptions: dict | None = None,
+    nsteps: int = 1500,
+    burnIn: int = 500,
+) -> list[dict]:
+    """
+    Fit the same WISE data under several emissivity prescriptions to measure the systematic spread of the
+    thermal prediction (the formal posterior of a single fit does not include the uncertainty of eps(lambda)).
+
+    Parameters
+    ----------
+    model : `~atm.models.NEATM`
+        Flux model.
+    obs : `~atm.obs.WISE`
+        Observatory.
+    data : `~pandas.DataFrame`
+        WISE observations (see `loadWiseFromDb`).
+    columnMapping : dict, optional
+        [Default = `~atm.Config.columnMapping`]
+    prescriptions : dict, optional
+        Name -> keyword arguments for `fitEmcee` (epsFixed or neowise).
+        [Default = `PRESCRIPTIONS`]
+    nsteps, burnIn : int, optional
+        Chain length per fit.
+
+    Returns
+    -------
+    list of dict
+        One entry per prescription with name, logD, logT1 (posterior medians), eps_tail (the emissivity continued
+        beyond W4) and chi2.
+    """
+    out = []
+    for name, kw in (prescriptions or PRESCRIPTIONS).items():
+        s = fitEmcee(
+            model,
+            obs,
+            data,
+            columnMapping=columnMapping,
+            nsteps=nsteps,
+            burnIn=burnIn,
+            verbose=False,
+            **kw,
+        )
+        tail = kw["neowise"]["eps"] if "neowise" in kw else kw["epsFixed"]["W4"]
+        out.append(
+            {
+                "name": name,
+                "logD": float(s["logD"].median()),
+                "logT1": float(s["logT1"].median()),
+                "eps_tail": float(tail),
+                "chi2": s.attrs["chi2_best"],
+            }
+        )
+    return out
+
+
+def prescriptionFluxJy(
+    model,
+    lambd: float,
+    fit: dict,
+    geometry: tuple[float, float, float],
+    threads: int = 1,
+) -> float:
+    """
+    Thermal NEATM flux density (eps = 1) at the posterior median of one prescription fit.
+
+    Parameters
+    ----------
+    model : `~atm.models.NEATM`
+        Flux model.
+    lambd : float
+        Wavelength in m.
+    fit : dict
+        One entry from `fitPrescriptions` (logD, logT1).
+    geometry : tuple of float
+        r [AU], delta [AU], alpha [rad].
+    threads : int, optional
+        Processes for the integration.
+
+    Returns
+    -------
+    float
+        Flux density in Jy.
+    """
+    one = pd.DataFrame({"logD": [fit["logD"]], "logT1": [fit["logT1"]]})
+    return float(thermalFluxJy(model, lambd, one, geometry, threads)[0])
 
 
 def _epsPerFilter(obs, eps: float, epsFixed: dict | None) -> np.ndarray:

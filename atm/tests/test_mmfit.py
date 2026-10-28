@@ -131,3 +131,20 @@ def test_neowiseFitRecoversTruth(synthetic):
     assert list(s.columns[:3]) == ["logD", "logT1", "p"]
     for p, t, tol in zip(["logD", "logT1", "p"], truth, [0.05, 0.02, 0.1]):
         assert abs(s[p].median() - t) < tol
+
+
+def test_fitPrescriptionsAndFlux(synthetic):
+    from ..mmfit import fitPrescriptions, prescriptionFluxJy
+
+    model, obs, df, cm = synthetic
+    pres = {
+        "neowise 0.9": {"neowise": {"eps": 0.9, "bands": ["W1", "W2"]}},
+        "eps_W3,W4=0.8,0.98": {"epsFixed": {"W3": 0.8, "W4": 0.98}},
+    }
+    out = fitPrescriptions(
+        model, obs, df, cm, prescriptions=pres, nsteps=150, burnIn=50
+    )
+    assert [q["name"] for q in out] == list(pres)
+    assert [q["eps_tail"] for q in out] == [0.9, 0.98]
+    f = prescriptionFluxJy(model, 1e-3, out[0], (2.0, 1.2, 0.3))
+    assert np.isfinite(f) and f > 0
