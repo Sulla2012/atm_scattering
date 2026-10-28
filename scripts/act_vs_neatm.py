@@ -195,6 +195,7 @@ def sedFigure(
     a,
     alma: list | None = None,
     presc: list | None = None,
+    samplesRaw: pd.DataFrame | None = None,
 ) -> None:
     """
     Figure-3-style SED (Orlowski-Scherer et al. 2024): lambda^4 F_lambda of the NEATM model fit to the WISE
@@ -250,36 +251,39 @@ def sedFigure(
     edge = 18.5e-6 if neowise else effL[-1]  # start of the 'beyond W4' emissivity
     baseTail = a.neowise_eps if neowise else float(eps4[:, -1].mean())
 
-    def flux(k: int, tail: float | EmissivityTable | None) -> np.ndarray:
+    def flux(
+        k: int, tail: float | EmissivityTable | None, alt: tuple | None = None
+    ) -> np.ndarray:
         """
         lambda^4 F_lambda [W m] for draw k. Beyond W4 the emissivity is `tail`: None keeps the W4 value, a float
         is a flat eps, and an `~atm.functions.EmissivityTable` is used where it is defined (the W4 value
         in the gap below its range, NaN above its longest wavelength, i.e. no extrapolation, and NaN inside the WISE
-        range so that only the part beyond W4 is drawn).
+        range so that only the part beyond W4 is drawn). `alt` = (post, th, eps4) evaluates another posterior.
         """
-        eps = np.interp(lam, effL, eps4[k])
+        post_, th_, eps4_ = alt or (post, th, eps4)
+        eps = np.interp(lam, effL, eps4_[k])
         nanMask = np.zeros(lam.shape, bool)
         if isinstance(tail, EmissivityTable):
             f = lambdaToGHz(lam)
             inr = (lam > edge) & (f >= tail.f_ghz[0]) & (f <= tail.f_ghz[-1])
-            eps = np.where(lam > edge, eps4[k, -1], eps)
+            eps = np.where(lam > edge, eps4_[k, -1], eps)
             eps[inr] = tail(lam[inr]) * (
-                eps4[k, -1] if a.l5_mode == "multiplicative" else 1.0
+                eps4_[k, -1] if a.l5_mode == "multiplicative" else 1.0
             )
             nanMask = (lam <= edge) | (f < tail.f_ghz[0])
         elif tail is not None:
             eps = np.where(lam > edge, tail, eps)
         # NEOWISE: albedo p only in W1/W2 (lambda < 6.5 um), none in W3/W4; otherwise Kirchhoff
         p = (
-            np.where(lam < 6.5e-6, post["p"].values[k], 0.0)
+            np.where(lam < 6.5e-6, post_["p"].values[k], 0.0)
             if neowise
             else (1 - eps) / calcQ(G)
         )
-        D = 10 ** post["logD"].values[k]
+        D = 10 ** post_["logD"].values[k]
         F = (
             D**2
             / (4 * d0**2 * AU**2)
-            * (eps * th[k] + p * calcHG(al0, G) * calcFluxLambdaSun(lam, r0))
+            * (eps * th_[k] + p * calcHG(al0, G) * calcFluxLambdaSun(lam, r0))
         )
         return np.where(nanMask, np.nan, F * lam**4)
 
@@ -295,6 +299,35 @@ def sedFigure(
     fig, ax = plt.subplots(figsize=(8, 5.5))
     base = np.array([flux(k, None) for k in range(len(T))])
     lo, med, hi = np.percentile(base, [2.5, 50, 97.5], axis=0)
+    rawB = rawL = None
+    if (
+        samplesRaw is not None
+    ):  # posterior of the fit with the measured WISE errors only (no error floor)
+        pr = samplesRaw.sample(a.n_sed_draws, random_state=1)
+        Tr = 10 ** pr["logT1"].values / np.sqrt(r0)
+        thr = model.calcTotalFluxLambdaEmittedToObsMany(
+            np.tile(lam, len(Tr)),
+            np.repeat(Tr, len(lam)),
+            np.full(len(Tr) * len(lam), al0),
+            threads=a.threads,
+        ).reshape(len(Tr), len(lam))
+        epsr = (
+            np.full((len(Tr), len(obs.filterNames)), a.neowise_eps)
+            if neowise
+            else np.array(
+                [
+                    [
+                        pr["eps"].values[k] if n not in epsFixed else epsFixed[n]
+                        for n in obs.filterNames
+                    ]
+                    for k in range(len(Tr))
+                ]
+            )
+        )
+        altR = (pr, thr, epsr)
+        rawB = np.percentile(
+            [flux(k, None, altR) for k in range(len(Tr))], [2.5, 50, 97.5], axis=0
+        )
     # Spread of the prediction under different emissivity prescriptions (fits of the same data); the formal
     # posterior of one fit does not include the uncertainty of eps(lambda). Evaluated beyond W4 only.
     envB = envL = None
@@ -381,6 +414,43 @@ def sedFigure(
             label=("eps_IR x L5 e(f)" if a.l5_mode == "multiplicative" else "L5 e(f)")
             + f" beyond W4 ({Path(a.emissivity).stem}), 95%",
         )
+    if rawB is not None:
+        chi = (
+            f"chi2 = {samplesRaw.attrs['chi2_best']:.0f} / {samplesRaw.attrs['ndata']}"
+        )
+        ax.fill_between(
+            lam * 1e6,
+            rawB[0],
+            rawB[2],
+            facecolor="k",
+            edgecolor="k",
+            lw=0.8,
+            alpha=0.6,
+            label=f"measured WISE errors only, no floor ({chi}), 95%",
+        )
+        if tables:
+            rawL = np.nanpercentile(
+                [flux(k, tables[k], altR) for k in range(len(altR[0]))],
+                [2.5, 50, 97.5],
+                axis=0,
+            )
+            ax.fill_between(
+                lam * 1e6,
+                rawL[0],
+                rawL[2],
+                facecolor="C4",
+                edgecolor="C4",
+                lw=0.8,
+                alpha=0.9,
+            )
+        w = lambda q: 100 * (q[2] - q[0]) / 2 / q[1]  # noqa: E731
+        for g in (90.0, 150.0, 220.0):
+            j = int(np.argmin(np.abs(lam - C / (g * 1e9))))
+            print(
+                f"1-sigma-equivalent width of the baseline prediction at {g:.0f} GHz: "
+                f"{w(np.array([lo[j], med[j], hi[j]])) / 2:.1f}% with the 0.15 mag floor (half of the 95% range), "
+                f"{w(np.array([rawB[0][j], rawB[1][j], rawB[2][j]])) / 2:.2f}% with measured errors only"
+            )
     if envB is not None:
         ax.fill_between(
             lam * 1e6,
@@ -453,6 +523,20 @@ def sedFigure(
     ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2)
     ins = ax.inset_axes([0.45, 0.08, 0.52, 0.4])
     ins.fill_between(lam * 1e6, lo, hi, alpha=0.25, color="C0")
+    if rawB is not None:
+        ins.fill_between(
+            lam * 1e6, rawB[0], rawB[2], facecolor="k", edgecolor="k", lw=0.8, alpha=0.6
+        )
+        if rawL is not None:
+            ins.fill_between(
+                lam * 1e6,
+                rawL[0],
+                rawL[2],
+                facecolor="C4",
+                edgecolor="C4",
+                lw=0.8,
+                alpha=0.9,
+            )
     if envB is not None:
         ins.fill_between(
             lam * 1e6, *envB, facecolor="none", edgecolor="0.35", hatch="///", lw=0
@@ -569,6 +653,11 @@ def main() -> None:
         "--show-flat",
         action="store_true",
         help="also draw dashed flat-emissivity lines (--flat-eps) beyond W4 on the lambda^4 F_lambda SED",
+    )
+    ap.add_argument(
+        "--no-raw-band",
+        action="store_true",
+        help="skip the fit with measured WISE errors only (no error floor), drawn as a narrow band on the SED",
     )
     ap.add_argument(
         "--no-systematics",
@@ -845,7 +934,21 @@ def main() -> None:
                 for q in presc
             ],
         )
-    sedFigure(model, obs, wise, samples, epsFixed, stack, a, alma, presc)
+    samplesRaw = None
+    if not a.no_raw_band:
+        samplesRaw = fitEmcee(
+            model,
+            obs,
+            loadWiseFromDb(a.db, a.designation, 0.0, obs),
+            epsFixed=epsFixed,
+            neowise={"eps": a.neowise_eps, "bands": ["W1", "W2"]}
+            if a.model == "neowise"
+            else None,
+            nsteps=a.nsteps,
+            burnIn=a.nsteps // 3,
+            verbose=False,
+        )
+    sedFigure(model, obs, wise, samples, epsFixed, stack, a, alma, presc, samplesRaw)
     html = (
         f"<h1>{a.asteroid}: ACT vs NEATM (flat emissivity)</h1>"
         f"<p>NEATM fit to WISE: logD = {samples['logD'].median():.3f}, logT1 = {samples['logT1'].median():.3f}, "
