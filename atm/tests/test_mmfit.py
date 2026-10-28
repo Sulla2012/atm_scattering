@@ -87,3 +87,47 @@ def test_epsFixedChangesOnlyThoseBands(synthetic):
     fixed = _modelFlux(model, obs, TRUTH, r, delta, alpha, 0.15, {"W4": 0.5})
     np.testing.assert_allclose(base[0, :3], fixed[0, :3])
     assert not np.isclose(base[0, 3], fixed[0, 3], rtol=1e-3, atol=0)
+
+
+def test_neowiseModeUsesFixedEpsAndBandAlbedo(synthetic):
+    """eps = 0.9 in all bands, albedo only in W1/W2: W3/W4 are pure thermal, W1/W2 gain reflected light with p."""
+    model, obs, _, _ = synthetic
+    r, delta, alpha = np.array([2.0]), np.array([1.2]), np.array([0.3])
+    cfg = {"eps": 0.9, "bands": ["W1", "W2"]}
+    th = np.array([3.0, TRUTH[1], 0.0])
+    noRefl = _modelFlux(model, obs, th, r, delta, alpha, 0.15, neowise=cfg)
+    withRefl = _modelFlux(
+        model, obs, th + [0, 0, 0.3], r, delta, alpha, 0.15, neowise=cfg
+    )
+    np.testing.assert_allclose(noRefl[0, 2:], withRefl[0, 2:])
+    assert np.all(withRefl[0, :2] > noRefl[0, :2])
+    # p = 0 thermal-only flux equals the Kirchhoff model's thermal part at the same eps (eps = 0.9, p = 0)
+    kirch = _modelFlux(
+        model, obs, np.array([3.0, TRUTH[1], 0.9]), r, delta, alpha, 0.15
+    )
+    assert np.all(kirch[0] >= noRefl[0] * (1 - 1e-12))
+
+
+def test_neowiseFitRecoversTruth(synthetic):
+    model, obs, df, cm = synthetic
+    cfg = {"eps": 0.9, "bands": ["W1", "W2"]}
+    r, delta, alpha = df["r_au"].values, df["delta_au"].values, df["alpha_rad"].values
+    truth = np.array([3.0, TRUTH[1], 0.25])
+    Y = _modelFlux(model, obs, truth, r, delta, alpha, 0.15, neowise=cfg)
+    d = df.copy()
+    for i, name in enumerate(obs.filterNames):
+        d[f"flux_{name}_si"], d[f"fluxErr_{name}_si"] = Y[:, i], 0.03 * Y[:, i]
+    s = fitEmcee(
+        model,
+        obs,
+        d,
+        columnMapping=cm,
+        neowise=cfg,
+        nwalkers=16,
+        nsteps=500,
+        burnIn=200,
+        verbose=False,
+    )
+    assert list(s.columns[:3]) == ["logD", "logT1", "p"]
+    for p, t, tol in zip(["logD", "logT1", "p"], truth, [0.05, 0.02, 0.1]):
+        assert abs(s[p].median() - t) < tol

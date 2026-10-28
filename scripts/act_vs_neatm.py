@@ -36,8 +36,9 @@ AU = Constants.ASTRONOMICAL_UNIT
 BUCKET = "s3://cornell-acteroids/"
 ARRAYS = ["pa4", "pa5", "pa6"]
 FREQS = ["090", "150", "220"]
-# Nominal ACT band centres [GHz]; the true bandpass (and spectral-index colour correction) is not modelled
-BAND_GHZ = {"090": 98.0, "150": 150.0, "220": 220.0}
+# Nominal ACT band centres [GHz], as used in the paper notebooks (lambda = c / nu); the true bandpass and the
+# spectral-index colour correction are not modelled
+BAND_GHZ = {"090": 90.0, "150": 150.0, "220": 220.0}
 
 
 def fetchAct(asteroid: str, array: str, freq: str, cache: Path) -> pd.DataFrame | None:
@@ -209,9 +210,7 @@ def sedFigure(
         Parsed CLI arguments (out, flat_eps, n_sed_draws, threads, sys_err).
     """
     cm = Config.columnMapping
-    r0, d0, al0 = (
-        float(wise[cm[k]].median()) for k in ["r_au", "delta_au", "alpha_rad"]
-    )
+    r0, d0, al0 = (float(wise[cm[k]].mean()) for k in ["r_au", "delta_au", "alpha_rad"])
     G = float(wise[cm["G"]].iloc[0])
     lam = np.logspace(-6, -2, 60)
     post = samples.sample(a.n_sed_draws, random_state=1)
@@ -222,16 +221,22 @@ def sedFigure(
         np.full(len(T) * len(lam), al0),
         threads=a.threads,
     ).reshape(len(T), len(lam))
-    eps4 = np.array(
-        [
+    neowise = a.model == "neowise"
+    if neowise:
+        eps4 = np.full((len(T), len(obs.filterNames)), a.neowise_eps)
+    else:
+        eps4 = np.array(
             [
-                post["eps"].values[k] if n not in epsFixed else epsFixed[n]
-                for n in obs.filterNames
+                [
+                    post["eps"].values[k] if n not in epsFixed else epsFixed[n]
+                    for n in obs.filterNames
+                ]
+                for k in range(len(T))
             ]
-            for k in range(len(T))
-        ]
-    )
+        )
     effL = obs.filterEffectiveLambdas
+    edge = 18.5e-6 if neowise else effL[-1]  # start of the 'beyond W4' emissivity
+    baseTail = a.neowise_eps if neowise else float(eps4[:, -1].mean())
 
     def flux(k: int, tail: float | EmissivityTable | None) -> np.ndarray:
         """
@@ -244,13 +249,18 @@ def sedFigure(
         nanMask = np.zeros(lam.shape, bool)
         if isinstance(tail, EmissivityTable):
             f = lambdaToGHz(lam)
-            inr = (lam > effL[-1]) & (f >= tail.f_ghz[0]) & (f <= tail.f_ghz[-1])
-            eps = np.where(lam > effL[-1], eps4[k, -1], eps)
+            inr = (lam > edge) & (f >= tail.f_ghz[0]) & (f <= tail.f_ghz[-1])
+            eps = np.where(lam > edge, eps4[k, -1], eps)
             eps[inr] = tail(lam[inr])
-            nanMask = (lam <= effL[-1]) | (f < tail.f_ghz[0])
+            nanMask = (lam <= edge) | (f < tail.f_ghz[0])
         elif tail is not None:
-            eps = np.where(lam > effL[-1], tail, eps)
-        p = (1 - eps) / calcQ(G)
+            eps = np.where(lam > edge, tail, eps)
+        # NEOWISE: albedo p only in W1/W2 (lambda < 6.5 um), none in W3/W4; otherwise Kirchhoff
+        p = (
+            np.where(lam < 6.5e-6, post["p"].values[k], 0.0)
+            if neowise
+            else (1 - eps) / calcQ(G)
+        )
         D = 10 ** post["logD"].values[k]
         F = (
             D**2
@@ -276,9 +286,11 @@ def sedFigure(
         lam * 1e6,
         med,
         c="C0",
-        label=f"NEATM fit to WISE (eps beyond W4 = {eps4[:, -1].mean():.2f}), 95%",
+        label=("NEOWISE NEATM fit to WISE" if neowise else "NEATM fit to WISE")
+        + f" (eps beyond W4 = {baseTail:.2f}), 95%",
     )
-    for i, x in enumerate(a.flat_eps[1:], start=1):
+    flats = [x for x in a.flat_eps if abs(x - baseTail) > 1e-9]
+    for i, x in enumerate(flats, start=1):
         ax.plot(
             lam * 1e6,
             np.median([flux(k, x) for k in range(len(T))], axis=0),
@@ -296,19 +308,20 @@ def sedFigure(
             lw=2,
             label=f"L5 e(f) beyond W4 ({Path(a.emissivity).stem}), 95%",
         )
-    for j, n in enumerate(obs.filterNames):
-        w, e = wise[cm["flux_si"][j]], wise[cm["fluxErr_si"][j]]
+    for j, n in enumerate(
+        obs.filterNames
+    ):  # median flux and median error per band, as plotObservations(plotMedian=True)
         ax.errorbar(
-            np.full(len(w), effL[j] * 1e6),
-            w * effL[j] ** 4,
-            e * effL[j] ** 4,
+            effL[j] * 1e6,
+            np.median(wise[cm["flux_si"][j]]) * effL[j] ** 4,
+            np.median(wise[cm["fluxErr_si"][j]]) * effL[j] ** 4,
             fmt="o",
             c="k",
             ms=3,
-            label="WISE" if j == 0 else None,
+            label="WISE (median)" if j == 0 else None,
         )
     Wgeo = d0**-2 * r0**-0.5 * 10 ** (-0.004 * np.degrees(al0))
-    sysErr = {98.0: 0.014, 150.0: 0.014, 220.0: 0.018}
+    sysErr = {90.0: 0.014, 150.0: 0.014, 220.0: 0.018}
     markers = {"pa4": "s", "pa5": "o", "pa6": "^"}
     zoom, labelled = [], set()
     for pnt in stack:
@@ -344,11 +357,11 @@ def sedFigure(
         f"{a.asteroid}: r={r0:.2f} AU, delta={d0:.2f} AU, alpha={np.degrees(al0):.0f} deg (WISE geometry)",
         fontsize=9,
     )
-    ax.legend(fontsize=7, loc="lower left")
+    ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2)
     ins = ax.inset_axes([0.45, 0.08, 0.52, 0.4])
     ins.fill_between(lam * 1e6, lo, hi, alpha=0.25, color="C0")
     ins.plot(lam * 1e6, med, c="C0")
-    for i, x in enumerate(a.flat_eps[1:], start=1):
+    for i, x in enumerate(flats, start=1):
         ins.plot(
             lam * 1e6,
             np.median([flux(k, x) for k in range(len(T))], axis=0),
@@ -360,12 +373,12 @@ def sedFigure(
         ins.plot(lam * 1e6, l5med, c="C4", lw=2)
     for x, y, ye, m in zoom:
         ins.errorbar(x, y, ye, fmt=m, c="r", ms=4)
-    ins.set(xlim=(1.1e3, 3.4e3))
+    ins.set(xlim=(1.1e3, 3.7e3))
     ymin = min(y - ye for _, y, ye, _ in zoom)
-    ins.set_ylim(0.8 * ymin, 1.2 * hi[(lam * 1e6 > 1.1e3) & (lam * 1e6 < 3.4e3)].max())
+    ins.set_ylim(0.8 * ymin, 1.2 * hi[(lam * 1e6 > 1.1e3) & (lam * 1e6 < 3.7e3)].max())
     ins.tick_params(labelsize=6)
     fig.tight_layout()
-    fig.savefig(a.out / "act_sed_lambda4.png", dpi=110)
+    fig.savefig(a.out / "act_sed_lambda4.png", dpi=110, bbox_inches="tight")
 
 
 def main() -> None:
@@ -380,7 +393,19 @@ def main() -> None:
     ap.add_argument(
         "--eps-fixed", nargs="+", default=["W3=0.8", "W4=0.98"], metavar="BAND=EPS"
     )
-    ap.add_argument("--sigma", type=float, default=0.10)
+    ap.add_argument(
+        "--sigma",
+        type=float,
+        default=0.15,
+        help="mag error offset (paper notebook class: 0.15)",
+    )
+    ap.add_argument(
+        "--model",
+        choices=["neowise", "kirchhoff"],
+        default="neowise",
+        help="neowise: eps fixed, albedo free in W1/W2 (paper1 run5a); kirchhoff: p = (1 - eps) / Q with --eps-fixed",
+    )
+    ap.add_argument("--neowise-eps", type=float, default=0.9)
     ap.add_argument("--astronaut-dir", type=Path, default=Path("../ASTRONAUT"))
     ap.add_argument("--cache-dir", type=Path, default=Path("data/act"))
     ap.add_argument(
@@ -446,6 +471,9 @@ def main() -> None:
         obs,
         wise,
         epsFixed=epsFixed,
+        neowise={"eps": a.neowise_eps, "bands": ["W1", "W2"]}
+        if a.model == "neowise"
+        else None,
         nsteps=a.nsteps,
         burnIn=a.nsteps // 3,
         verbose=False,
@@ -506,6 +534,19 @@ def main() -> None:
             }
         )
     table = pd.DataFrame(rows)
+    comb = pd.DataFrame(
+        [
+            {
+                "GHz": g,
+                "eps_combined": np.average(
+                    d["eps_implied"], weights=1 / d["stat_err"] ** 2
+                ),
+                "stat_err": float((1 / d["stat_err"] ** 2).sum() ** -0.5),
+            }
+            for g, d in table.groupby("GHz")
+        ]
+    )
+    print(comb.round(3).to_string(index=False))
     pd.set_option("display.width", 250)
     print(table.round(3).to_string())
 
@@ -601,7 +642,7 @@ def main() -> None:
         f"<h1>{a.asteroid}: ACT vs NEATM (flat emissivity)</h1>"
         f"<p>NEATM fit to WISE: logD = {samples['logD'].median():.3f}, logT1 = {samples['logT1'].median():.3f}, "
         f"chi2 = {samples.attrs['chi2_best']:.1f} / {samples.attrs['ndata']}. Band centres are nominal; no colour correction.</p>"
-        f'<img src="act_sed_lambda4.png"><img src="act_vs_neatm_sed.png"><img src="act_vs_neatm_scatter.png">{table.round(3).to_html(index=False)}'
+        f'<img src="act_sed_lambda4.png"><img src="act_vs_neatm_sed.png"><img src="act_vs_neatm_scatter.png">{comb.round(3).to_html(index=False)}{table.round(3).to_html(index=False)}'
     )
     (a.out / "act_vs_neatm.html").write_text(html)
     print(a.out / "act_vs_neatm.html")

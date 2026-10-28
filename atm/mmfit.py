@@ -133,35 +133,42 @@ def _epsPerFilter(obs, eps: float, epsFixed: dict | None) -> np.ndarray:
 
 
 def _modelFlux(
-    model, obs, theta: np.ndarray, r, delta, alpha, G, epsFixed: dict | None = None
+    model,
+    obs,
+    theta: np.ndarray,
+    r,
+    delta,
+    alpha,
+    G,
+    epsFixed: dict | None = None,
+    neowise: dict | None = None,
 ) -> np.ndarray:
     """
-    IR model flux (thermal plus reflected) for parameters theta = (logD, logT1, eps). Filters in
-    `epsFixed` use their fixed emissivity instead of eps; each filter's albedo follows Kirchhoff,
-    p = (1 - eps) / Q.
+    IR model flux (thermal plus reflected) for parameters theta = (logD, logT1, x).
+
+    By default x is eps: filters in `epsFixed` use their fixed emissivity instead of eps, and each
+    filter's albedo follows Kirchhoff, p = (1 - eps) / Q. With `neowise` x is the albedo p of the
+    listed bands, every filter has the fixed emissivity neowise["eps"], and the other filters have p = 0
+    (the NEOWISE prescription, run5a of paper1).
 
     Returns
     -------
     `~numpy.ndarray` (N, M)
         Flux in W m^-3 for N observations by M filters.
     """
-    logD, logT1, eps = theta
-    r, delta, alpha = (np.atleast_1d(x) for x in (r, delta, alpha))
-    epsF = _epsPerFilter(obs, eps, epsFixed)
+    logD, logT1, x = theta
+    r, delta, alpha = (np.atleast_1d(v) for v in (r, delta, alpha))
+    if neowise is None:
+        epsF = _epsPerFilter(obs, x, epsFixed)
+        pF = (1 - epsF) / calcQ(G)
+    else:
+        epsF = np.full(len(obs.filterNames), float(neowise["eps"]))
+        pF = np.array([x if n in neowise["bands"] else 0.0 for n in obs.filterNames])
     # WISE-style bandpassLambda returns (M, N), SPHEREx-style (N, M); eps broadcasts along filters
     wiseLike = obs.acronym != "SPHEREx"
-    e = epsF[:, None] if wiseLike else epsF
+    e, p = (v[:, None] if wiseLike else v for v in (epsF, pF))
     flux = interpFluxLambdaObsWithSunlight(
-        model,
-        obs,
-        r,
-        delta,
-        10**logT1 / np.sqrt(r),
-        10**logD,
-        alpha,
-        e,
-        (1 - e) / calcQ(G),
-        G,
+        model, obs, r, delta, 10**logT1 / np.sqrt(r), 10**logD, alpha, e, p, G
     )
     return flux.T if wiseLike else flux
 
@@ -173,6 +180,7 @@ def fitEmcee(
     columnMapping: dict = Config.columnMapping,
     parameterPriors: dict = Config.parameterPriors,
     epsFixed: dict | None = None,
+    neowise: dict | None = None,
     nwalkers: int = 32,
     nsteps: int = 3000,
     burnIn: int = 1000,
@@ -202,6 +210,10 @@ def fitEmcee(
     epsFixed : dict, optional
         Filter name -> fixed emissivity (e.g. {"W3": 0.8, "W4": 0.98}, as in the paper1 runs). All other
         filters share the fitted eps, and every filter's albedo follows Kirchhoff.
+    neowise : dict, optional
+        NEOWISE prescription, {"eps": 0.9, "bands": ["W1", "W2"]}: all filters share the fixed emissivity, the
+        albedo p of the listed bands is fitted instead of eps, and the other filters have p = 0. The third
+        parameter (column) is then p. Overrides epsFixed.
     nwalkers : int, optional
         Number of emcee walkers.
     nsteps : int, optional
@@ -216,7 +228,7 @@ def fitEmcee(
     Returns
     -------
     `~pandas.DataFrame`
-        Flattened post-burn-in samples with columns logD, logT1, eps, logprob; the
+        Flattened post-burn-in samples with columns logD, logT1, eps (p in NEOWISE mode), logprob; the
         acceptance fraction and the best-fit reduced chi^2 are stored in `.attrs`.
     """
     model.loadLambdaTables(obs.filterQuadratureLambdas, verbose=verbose)
@@ -228,8 +240,9 @@ def fitEmcee(
     Y = data[columnMapping["flux_si"]].values.astype(float)
     Y_err = data[columnMapping["fluxErr_si"]].values.astype(float)
     good = np.isfinite(Y) & np.isfinite(Y_err)
-    lo = np.array([parameterPriors[p]["lower"] for p in FIT_PARAMETERS])
-    hi = np.array([parameterPriors[p]["upper"] for p in FIT_PARAMETERS])
+    names = FIT_PARAMETERS[:2] + (["eps"] if neowise is None else ["p"])
+    lo = np.array([parameterPriors[n]["lower"] for n in names])
+    hi = np.array([parameterPriors[n]["upper"] for n in names])
 
     def chi2(theta: np.ndarray) -> float:
         T_ss = 10 ** theta[1] / np.sqrt(r)
@@ -243,7 +256,12 @@ def fitEmcee(
         return float(
             (
                 (
-                    (Y - _modelFlux(model, obs, theta, r, delta, alpha, G, epsFixed))
+                    (
+                        Y
+                        - _modelFlux(
+                            model, obs, theta, r, delta, alpha, G, epsFixed, neowise
+                        )
+                    )
                     / Y_err
                 )[good]
                 ** 2
@@ -265,7 +283,7 @@ def fitEmcee(
         [
             rng.uniform(1, 6, 400),
             rng.uniform(logT1_lo, logT1_hi, 400),
-            rng.uniform(0.5, 1, 400),
+            rng.uniform(0.5, 1, 400) if neowise is None else rng.uniform(0, 1, 400),
         ]
     )
     start = box[np.argmin([chi2(t) for t in box])]
@@ -279,7 +297,7 @@ def fitEmcee(
     sampler = emcee.EnsembleSampler(nwalkers, 3, logProb)
     sampler.run_mcmc(p0, nsteps, progress=verbose)
     flat = sampler.get_chain(discard=burnIn, flat=True)
-    out = pd.DataFrame(flat, columns=FIT_PARAMETERS)
+    out = pd.DataFrame(flat, columns=names)
     out["logprob"] = sampler.get_log_prob(discard=burnIn, flat=True)
     out.attrs.update(
         acceptance=float(sampler.acceptance_fraction.mean()),
