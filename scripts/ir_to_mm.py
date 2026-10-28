@@ -71,6 +71,57 @@ def syntheticData(
     return df
 
 
+def loadActPoints(
+    cache: Path, asteroid: str, geometry: tuple[float, float, float]
+) -> list[dict]:
+    """
+    Stacked ACT flux per array and band, scaled to a given geometry with the paper's Eq. 1.
+
+    Each ASTRONAUT light-curve point gives F_0 = flux * weight (flux at 1 AU / 1 AU / alpha = 0); the
+    inverse-variance mean of F_0 is scaled by W = d_earth^-2 d_sun^-1/2 10^(-0.004 alpha[deg]). The paper's
+    systematic gain uncertainty (1.4% at f090/f150, 1.8% at f220) is added in quadrature.
+
+    Parameters
+    ----------
+    cache : `~pathlib.Path`
+        Directory holding (or receiving) the ASTRONAUT FITS files.
+    asteroid : str
+        Name in the ASTRONAUT database.
+    geometry : tuple of float
+        r [AU], delta [AU], alpha [rad] to scale to.
+
+    Returns
+    -------
+    list of dict
+        Entries with array, GHz (nominal band centre), F_mJy and err_mJy.
+    """
+    from act_vs_neatm import ARRAYS, BAND_GHZ, FREQS, fetchAct, weightedMean
+
+    r, delta, alpha = geometry
+    W = delta**-2 * r**-0.5 * 10 ** (-0.004 * np.degrees(alpha))
+    sysErr = {"090": 0.014, "150": 0.014, "220": 0.018}
+    cache.mkdir(parents=True, exist_ok=True)
+    out = []
+    for arr in ARRAYS:
+        for f in FREQS:
+            df = fetchAct(asteroid, arr, f, cache)
+            if df is None:
+                continue
+            F0, err = weightedMean(
+                df["flux"].values * df["weight"].values,
+                df["err"].values * df["weight"].values,
+            )
+            out.append(
+                {
+                    "array": arr,
+                    "GHz": BAND_GHZ[f],
+                    "F_mJy": F0 * W,
+                    "err_mJy": float(np.hypot(err, sysErr[f] * F0)) * W,
+                }
+            )
+    return out
+
+
 def main() -> None:
     """Parse the CLI, run the fit, predict the mm spectrum and write figures plus an HTML report."""
     ap = argparse.ArgumentParser(description=__doc__)
@@ -137,6 +188,15 @@ def main() -> None:
     ap.add_argument("--nsteps", type=int, default=3000)
     ap.add_argument("--n-draws", type=int, default=200)
     ap.add_argument("--out", type=Path, default=Path("reports"))
+    ap.add_argument(
+        "--act-cache",
+        type=Path,
+        default=None,
+        help="directory of ASTRONAUT FITS files (downloaded there if missing): overlays the stacked ACT points on the SED",
+    )
+    ap.add_argument(
+        "--act-asteroid", default="Vesta", help="name in the ASTRONAUT database"
+    )
     ap.add_argument("--debug", action="store_true", help="short chain, 20 draws")
     a = ap.parse_args()
     if a.debug:
@@ -195,6 +255,28 @@ def main() -> None:
         nDraws=a.n_draws,
     )
 
+    act = (
+        loadActPoints(a.act_cache, a.act_asteroid, (r, delta, alpha))
+        if a.act_cache
+        else []
+    )
+    if act:
+        fAct = np.array(sorted({p["GHz"] for p in act}))
+        constAct = predictMm(
+            mmModel,
+            samples,
+            EmissivityTable(fe, np.ones_like(fe)),
+            fAct,
+            r,
+            delta,
+            alpha,
+            nDraws=a.n_draws,
+        )["med"]
+        for (
+            pnt
+        ) in act:  # model at eps = 1 and the implied flat emissivity at each ACT point
+            pnt["model"] = float(constAct[list(fAct).index(pnt["GHz"])])
+
     fig, ax = plt.subplots(1, 3, figsize=(14, 3.8))
     lam = obs.filterEffectiveLambdas
     logD, logT1, eps = samples[["logD", "logT1", "eps"]].median()
@@ -248,12 +330,42 @@ def main() -> None:
         ax_.plot(f, g(pred["med"]), label="NEATM with e(f)")
         ax_.plot(f, g(const["med"]), "k--", label="NEATM with eps = 1")
         ax_.set(xscale="log", yscale="log", ylabel=label)
+    markers = {"pa4": "s", "pa5": "o", "pa6": "^"}
+    for pnt in act:
+        nu, lm = pnt["GHz"] * 1e9, c / (pnt["GHz"] * 1e9)
+        y, ye = pnt["F_mJy"] * 1e-29, pnt["err_mJy"] * 1e-29  # W m^-2 Hz^-1
+        for ax_, scale in [(top, nu), (mid, c * lm**2)]:
+            ax_.errorbar(
+                pnt["GHz"],
+                y * scale,
+                ye * scale,
+                fmt=markers[pnt["array"]],
+                c="r",
+                ms=5,
+            )
+        bot.errorbar(
+            pnt["GHz"],
+            pnt["F_mJy"] / (1e3 * pnt["model"]),
+            pnt["err_mJy"] / (1e3 * pnt["model"]),
+            fmt=markers[pnt["array"]],
+            c="r",
+            ms=5,
+            label=f"ACT {pnt['array']}"
+            if pnt["array"] not in [q["array"] for q in act[: act.index(pnt)]]
+            else None,
+        )
     top.legend()
     ratio = pred["F_nu"] / const["F_nu"]
     bot.fill_between(f, *np.percentile(ratio, [16, 84], axis=0), alpha=0.3)
     bot.plot(f, np.median(ratio, axis=0))
     bot.axhline(1, c="k", ls="--")
-    bot.set(xlabel="GHz", ylabel="e(f) / (eps = 1)")
+    bot.set(xlabel="GHz", ylabel="ratio to eps = 1")
+    for ax_ in (top, mid, bot):
+        ax_.relim()
+        ax_.autoscale_view()
+    bot.set_xlim(f[0] * 0.85, f[-1] * 1.2)
+    if act:
+        bot.legend(fontsize=7, ncol=3)
     sed.tight_layout()
     sed.savefig(a.out / f"ir_to_mm_{a.obs}_sed.png", dpi=100)
     html = (
