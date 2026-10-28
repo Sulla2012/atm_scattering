@@ -104,3 +104,4 @@ ENV/
 ADR4.dat
 atm/version.py
 data/act/
+data/mm_tables/
