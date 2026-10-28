@@ -1,6 +1,7 @@
 """Fit IR photometry (WISE or SPHEREx) with NEATM and predict the mm spectrum with Meteorites-TeraFlash e(f)."""
 
 import argparse
+import json
 import os
 from pathlib import Path
 
@@ -14,7 +15,14 @@ import pandas as pd
 from atm.config import Config
 from atm.constants import Constants
 from atm.functions.emissivity import EmissivityTable, ghzToLambda
-from atm.mmfit import _modelFlux, fitEmcee, fluxLambdaToJy, loadWiseFromDb, predictMm
+from atm.mmfit import (
+    _modelFlux,
+    fitEmcee,
+    fluxLambdaToJy,
+    loadWiseFromDb,
+    predictMm,
+    thermalFluxJy,
+)
 from atm.models import NEATM
 from atm.obs import WISE, SPHEREx
 
@@ -206,6 +214,16 @@ def main() -> None:
     ap.add_argument(
         "--act-asteroid", default="Vesta", help="name in the ASTRONAUT database"
     )
+    ap.add_argument(
+        "--alma-json",
+        type=Path,
+        default=None,
+        help="JSON from scripts/alma_flux.py: ALMA point(s) overlaid on the SED (scaled to the reference geometry "
+        "with the NEATM model, so its ratio to NEATM(eps = 1) is the exact implied emissivity)",
+    )
+    ap.add_argument(
+        "--threads", type=int, default=8, help="processes for direct NEATM integrations"
+    )
     ap.add_argument("--debug", action="store_true", help="short chain, 20 draws")
     a = ap.parse_args()
     if a.debug:
@@ -292,6 +310,35 @@ def main() -> None:
         ) in act:  # model at eps = 1 and the implied flat emissivity at each ACT point
             pnt["model"] = float(constAct[list(fAct).index(pnt["GHz"])])
 
+    alma = []
+    if a.alma_json:
+        post50 = samples.sample(min(50, len(samples)), random_state=0)
+        for pnt in json.loads(a.alma_json.read_text()):
+            lm = c / (pnt["GHz"] * 1e9)
+            Fa = thermalFluxJy(
+                model,
+                lm,
+                post50,
+                (pnt["r_au"], pnt["delta_au"], pnt["alpha_rad"]),
+                a.threads,
+            )
+            Fr = thermalFluxJy(model, lm, post50, (r, delta, alpha), a.threads)
+            scale, M = float(np.median(Fr / Fa)), float(np.median(Fa))
+            alma.append(
+                {
+                    **pnt,
+                    "F_ref_Jy": pnt["F_mJy"] * 1e-3 * scale,
+                    "err_ref_Jy": pnt["err_mJy"] * 1e-3 * scale,
+                    "implied_eps": pnt["F_mJy"] * 1e-3 / M,
+                    "implied_eps_err": pnt["err_mJy"] * 1e-3 / M,
+                }
+            )
+            print(
+                f"{pnt['label']}: F = {pnt['F_mJy']:.1f} +/- {pnt['err_mJy']:.1f} mJy; "
+                f"NEATM(eps=1) at the ALMA geometry = {1e3 * M:.1f} mJy; "
+                f"implied eps = {alma[-1]['implied_eps']:.3f} +/- {alma[-1]['implied_eps_err']:.3f}"
+            )
+
     fig, ax = plt.subplots(1, 3, figsize=(14, 3.8))
     lam = obs.filterEffectiveLambdas
     logD, logT1, third = samples[
@@ -372,6 +419,20 @@ def main() -> None:
             if pnt["array"] not in [q["array"] for q in act[: act.index(pnt)]]
             else None,
         )
+    for pnt in alma:
+        nu, lm = pnt["GHz"] * 1e9, c / (pnt["GHz"] * 1e9)
+        y, ye = pnt["F_ref_Jy"] * 1e-26, pnt["err_ref_Jy"] * 1e-26
+        for ax_, scale in [(top, nu), (mid, c * lm**2)]:
+            ax_.errorbar(pnt["GHz"], y * scale, ye * scale, fmt="D", c="g", ms=6)
+        bot.errorbar(
+            pnt["GHz"],
+            pnt["implied_eps"],
+            pnt["implied_eps_err"],
+            fmt="D",
+            c="g",
+            ms=6,
+            label=pnt["label"],
+        )
     top.legend()
     ratio = pred["F_nu"] / const["F_nu"]
     bot.fill_between(f, *np.percentile(ratio, [16, 84], axis=0), alpha=0.3)
@@ -383,8 +444,8 @@ def main() -> None:
         ax_.margins(y=0.12)
         ax_.autoscale_view()
     bot.set_xlim(f[0] * 0.85, f[-1] * 1.2)
-    if act:
-        bot.legend(fontsize=7, ncol=3)
+    if act or alma:
+        bot.legend(fontsize=7, ncol=4)
     sed.tight_layout()
     sed.savefig(a.out / f"ir_to_mm_{a.obs}_sed.png", dpi=100)
     html = (

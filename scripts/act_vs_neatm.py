@@ -3,6 +3,7 @@ effective emissivity. NEATM is fit to WISE photometry (atm_data sample.db); the 
 true r, delta, alpha of every ACT observation (JPL Horizons)."""
 
 import argparse
+import json
 import os
 import sys
 import time
@@ -29,7 +30,13 @@ from atm.functions.emissivity import (
     lambdaToGHz,
 )
 from atm.functions.interpolate_flux_lambda import interpFluxLambdaAtObs
-from atm.mmfit import checkTableRange, fitEmcee, fluxLambdaToJy, loadWiseFromDb
+from atm.mmfit import (
+    checkTableRange,
+    fitEmcee,
+    fluxLambdaToJy,
+    loadWiseFromDb,
+    thermalFluxJy,
+)
 from atm.models import NEATM
 from atm.obs import WISE
 
@@ -184,6 +191,7 @@ def sedFigure(
     epsFixed: dict,
     stack: list,
     a,
+    alma: list | None = None,
 ) -> None:
     """
     Figure-3-style SED (Orlowski-Scherer et al. 2024): lambda^4 F_lambda of the NEATM model fit to the WISE
@@ -372,8 +380,38 @@ def sedFigure(
     if l5 is not None:
         ins.fill_between(lam * 1e6, l5lo, l5hi, alpha=0.25, color="C4")
         ins.plot(lam * 1e6, l5med, c="C4", lw=2)
+    for pnt in alma or []:
+        lm = 299792458.0 / (pnt["GHz"] * 1e9)
+        Fa = thermalFluxJy(
+            model, lm, post, (pnt["r_au"], pnt["delta_au"], pnt["alpha_rad"]), a.threads
+        )
+        Fr = thermalFluxJy(model, lm, post, (r0, d0, al0), a.threads)
+        scale = float(np.median(Fr / Fa))  # NEATM-based scaling to the WISE geometry
+        y, ye = (
+            pnt[k] * 1e-3 * scale * 1e-26 * 299792458.0 * lm**2
+            for k in ("F_mJy", "err_mJy")
+        )
+        ax.errorbar(lm * 1e6, y, ye, fmt="D", c="g", ms=6, label=pnt["label"])
+        zoom.append((lm * 1e6, y, ye, "D"))
+        ins.errorbar(lm * 1e6, y, ye, fmt="D", c="g", ms=5)
+        eps = pnt["F_mJy"] * 1e-3 / float(np.median(Fa))
+        eL5 = (
+            float(
+                np.interp(
+                    pnt["GHz"], *(np.load(a.emissivity)[k] for k in ("f_ghz", "e"))
+                )
+            )
+            if a.emissivity
+            else np.nan
+        )
+        print(
+            f"{pnt['label']}: implied eps = {eps:.3f} +/- {pnt['err_mJy'] * 1e-3 / float(np.median(Fa)):.3f}; L5 e = {eL5:.3f}; implied / L5 = {eps / eL5:.3f}"
+        )
+    if alma:  # refresh the legend so that the ALMA entry appears
+        ax.legend(fontsize=7, loc="upper center", bbox_to_anchor=(0.5, -0.14), ncol=2)
     for x, y, ye, m in zoom:
-        ins.errorbar(x, y, ye, fmt=m, c="r", ms=4)
+        if m != "D":
+            ins.errorbar(x, y, ye, fmt=m, c="r", ms=4)
     ins.set(xlim=(1.1e3, 3.7e3))
     ymin = min(y - ye for _, y, ye, _ in zoom)
     ins.set_ylim(0.8 * ymin, 1.2 * hi[(lam * 1e6 > 1.1e3) & (lam * 1e6 < 3.7e3)].max())
@@ -421,6 +459,12 @@ def main() -> None:
         type=lambda x: Path(x) if x else None,
         default=Path("../Meteorites-TeraFlash/results/emissivity/L5_l5c.npz"),
         help="TeraFlash e(f) NPZ overlaid on the SED (pass an empty string to skip)",
+    )
+    ap.add_argument(
+        "--alma-json",
+        type=Path,
+        default=None,
+        help="JSON from scripts/alma_flux.py, overlaid on the lambda^4 F_lambda SED",
     )
     ap.add_argument(
         "--n-sed-draws",
@@ -660,7 +704,8 @@ def main() -> None:
     ax[1].legend()
     fig.tight_layout()
     fig.savefig(a.out / "act_vs_neatm_sed.png", dpi=100)
-    sedFigure(model, obs, wise, samples, epsFixed, stack, a)
+    alma = json.loads(a.alma_json.read_text()) if a.alma_json else []
+    sedFigure(model, obs, wise, samples, epsFixed, stack, a, alma)
     html = (
         f"<h1>{a.asteroid}: ACT vs NEATM (flat emissivity)</h1>"
         f"<p>NEATM fit to WISE: logD = {samples['logD'].median():.3f}, logT1 = {samples['logT1'].median():.3f}, "

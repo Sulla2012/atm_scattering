@@ -24,6 +24,7 @@ __all__ = [
     "fitEmcee",
     "fluxLambdaToJy",
     "loadWiseFromDb",
+    "thermalFluxJy",
     "predictMm",
 ]
 
@@ -116,6 +117,45 @@ def loadWiseFromDb(db, designation: str, sigma: float, obs) -> pd.DataFrame:
     df = modifyErrors(df, obs, sigma=sigma)
     df["alpha_rad"] = np.radians(df["alpha_deg"])
     return df
+
+
+def thermalFluxJy(
+    model,
+    lambd: float,
+    post: pd.DataFrame,
+    geometry: tuple[float, float, float],
+    threads: int = 1,
+) -> np.ndarray:
+    """
+    Thermal NEATM flux density (eps = 1, no reflected light) of each posterior draw, by direct integration
+    (no lookup tables), at one wavelength and observing geometry.
+
+    Parameters
+    ----------
+    model : `~atm.models.NEATM`
+        Flux model.
+    lambd : float
+        Wavelength in m.
+    post : `~pandas.DataFrame`
+        Posterior draws with columns logD, logT1.
+    geometry : tuple of float
+        r [AU], delta [AU], alpha [rad] of the observation.
+    threads : int, optional
+        Number of processes for the integrations.
+
+    Returns
+    -------
+    `~numpy.ndarray` (K)
+        Flux density in Jy for K draws.
+    """
+    r, delta, alpha = geometry
+    T = 10 ** post["logT1"].values / np.sqrt(r)
+    th = model.calcTotalFluxLambdaEmittedToObsMany(
+        np.full(len(T), lambd), T, np.full(len(T), alpha), threads=threads
+    )
+    return fluxLambdaToJy(
+        10 ** (2 * post["logD"].values) / (4 * delta**2 * AU**2) * th, lambd
+    )
 
 
 def _epsPerFilter(obs, eps: float, epsFixed: dict | None) -> np.ndarray:
