@@ -11,11 +11,13 @@ import numpy as np
 import pandas as pd
 
 from atm.config import Config
-from atm.functions.emissivity import EmissivityTable
+from atm.constants import Constants
+from atm.functions.emissivity import EmissivityTable, ghzToLambda
 from atm.mmfit import _modelFlux, fitEmcee, fluxLambdaToJy, predictMm
 from atm.models import NEATM
 from atm.obs import WISE, SPHEREx
 
+c = Constants.LIGHTSPEED
 OBS = {"WISE": WISE, "SPHEREx": SPHEREx}
 
 
@@ -196,18 +198,27 @@ def main() -> None:
     ax[2].legend()
     fig.tight_layout()
     fig.savefig(a.out / f"ir_to_mm_{a.obs}.png", dpi=100)
-    sed, (top, bot) = plt.subplots(
-        2, 1, figsize=(7, 6), sharex=True, gridspec_kw={"height_ratios": [3, 1.3]}
+    sed, (top, mid, bot) = plt.subplots(
+        3, 1, figsize=(7, 8), sharex=True, gridspec_kw={"height_ratios": [3, 3, 1.3]}
     )
+    lam_m = ghzToLambda(f)
 
     def nuF(F: np.ndarray) -> np.ndarray:
         """nu F_nu [W m^-2] from F_nu [Jy] at the frequencies f [GHz]."""
         return F * f * 1e9 * 1e-26
 
-    top.fill_between(f, nuF(pred["lo"]), nuF(pred["hi"]), alpha=0.3)
-    top.plot(f, nuF(pred["med"]), label="NEATM with e(f)")
-    top.plot(f, nuF(const["med"]), "k--", label="NEATM with eps = 1")
-    top.set(xscale="log", yscale="log", ylabel=r"$\nu F_\nu$ [W m$^{-2}$]")
+    def lam4F(F: np.ndarray) -> np.ndarray:
+        """lambda^4 F_lambda [W m] from F_nu [Jy] at the frequencies f [GHz] (flat in the Rayleigh-Jeans limit)."""
+        return F * 1e-26 * c * lam_m**2
+
+    for ax_, g, label in [
+        (top, nuF, r"$\nu F_\nu$ [W m$^{-2}$]"),
+        (mid, lam4F, r"$\lambda^4 F_\lambda$ [W m]"),
+    ]:
+        ax_.fill_between(f, g(pred["lo"]), g(pred["hi"]), alpha=0.3)
+        ax_.plot(f, g(pred["med"]), label="NEATM with e(f)")
+        ax_.plot(f, g(const["med"]), "k--", label="NEATM with eps = 1")
+        ax_.set(xscale="log", yscale="log", ylabel=label)
     top.legend()
     ratio = pred["F_nu"] / const["F_nu"]
     bot.fill_between(f, *np.percentile(ratio, [16, 84], axis=0), alpha=0.3)
